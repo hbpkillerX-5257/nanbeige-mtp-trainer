@@ -11,7 +11,7 @@ class TrainingConfig:
     dataset_name: str = "tatsu-lab/alpaca"
     dataset_config: Optional[str] = None
     max_seq_len: int = 1024
-    max_samples: int = 52000  # Full Alpaca dataset
+    max_samples: int = 5000  # Limited dataset for testing
     
     # Checkpointing
     resume_from_checkpoint: bool = True

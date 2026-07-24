@@ -225,6 +225,24 @@ def train(resume: bool = False):
             mtp_preds = torch.argmax(mtp_log_probs_flat, dim=-1)
             correct_tokens = (mtp_preds == teacher_preds).sum().item()
             total_tokens = teacher_preds.numel()
+            if is_main_process and step % 50 == 0 and total_tokens > 0:
+                print(f"\n--- Step {step} Generation Sample ---")
+                # Get the original index of the first valid token
+                valid_indices = torch.nonzero(valid_mask).squeeze()
+                if valid_indices.numel() > 0:
+                    first_valid_idx = valid_indices[0].item() if valid_indices.dim() > 0 else valid_indices.item()
+                    batch_idx = first_valid_idx // (targets.size(1))
+                    seq_idx = first_valid_idx % (targets.size(1))
+                    
+                    ctx_end = seq_idx + 2 # +2 because targets is shifted by 2
+                    ctx = tokenizer.decode(input_ids[batch_idx][:ctx_end])
+                    teacher_tok = tokenizer.decode([teacher_preds[0].item()])
+                    mtp_tok = tokenizer.decode([mtp_preds[0].item()])
+                    print(f"Context: {repr(ctx)}")
+                    print(f"Teacher Predicts: {repr(teacher_tok)}")
+                    print(f"MTP Head Predicts: {repr(mtp_tok)}")
+                    print("-----------------------------------\n")
+
             if torch.isnan(loss) or torch.isinf(loss):
                 continue
             
