@@ -35,18 +35,32 @@ def run():
     inputs = tokenizer(text, return_tensors="pt").to(device)
 
     with torch.no_grad():
-        outputs = model(inputs["input_ids"], attention_mask=inputs["attention_mask"], use_cache=False)
+        outputs = model(inputs["input_ids"], attention_mask=inputs["attention_mask"], output_hidden_states=True, use_cache=False)
         logits = outputs.logits
         preds = torch.argmax(logits, dim=-1)[0]
         
+        hidden = outputs.hidden_states[-1][0] # shape: [seq_len, hidden_size]
+        
+        print("\n--- Diagnostic Analysis ---")
         print(f"Logits shape: {logits.shape}")
+        
+        # Check if hidden states change across positions
+        h_diffs = []
+        for i in range(1, hidden.shape[0]):
+            diff = torch.norm(hidden[i] - hidden[i-1]).item()
+            h_diffs.append(diff)
+        
+        print(f"\nHidden state differences between consecutive tokens:")
+        print(f"Diffs: {[round(d, 4) for d in h_diffs]}")
+        
+        # Check if all tokens predict the same thing
+        unique_preds = torch.unique(preds)
+        print(f"\nUnique tokens predicted across {len(preds)} positions: {len(unique_preds)}")
         
         for i, p in enumerate(preds):
             ctx = tokenizer.decode(inputs["input_ids"][0][:i+1])
             pred = tokenizer.decode([p.item()])
             print(f"Token {i} | Context: {repr(ctx)} | Predicts: {repr(pred)}")
-            
-        print("\nSkipping .generate() due to HuggingFace DynamicCache version incompatibility.")
 
 if __name__ == "__main__":
     run()
