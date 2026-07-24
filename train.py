@@ -183,6 +183,9 @@ def train():
                 # Token embeddings e(y_{t+1}) (the actual next token): [B, S-2, D]
                 embed_layer = base_model.get_input_embeddings()
                 emb_next = embed_layer(input_ids[:, 1:-1])
+                
+                # Extract ground truth targets for masking out padding
+                targets = input_ids[:, 2:]
 
             # Forward pass through MTP module in explicit float32
             mtp_features = mtp_module(h_t.to(torch.float32), emb_next.to(torch.float32))
@@ -196,12 +199,14 @@ def train():
             mtp_log_probs = F.log_softmax(mtp_logits.to(torch.float32), dim=-1)
             teacher_probs = F.softmax(target_logits.to(torch.float32), dim=-1)
             
+            # CRITICAL FIX: Mask out padding tokens so we don't compute KD on garbage!
+            valid_mask = (targets != tokenizer.pad_token_id).view(-1)
+            
+            # Flatten to [N, Vocab] and filter out padding tokens
+            mtp_log_probs_flat = mtp_log_probs.view(-1, mtp_log_probs.size(-1))[valid_mask]
+            teacher_probs_flat = teacher_probs.view(-1, teacher_probs.size(-1))[valid_mask]
+            
             kl_loss_fn = nn.KLDivLoss(reduction="batchmean")
-            
-            # Flatten to [N, Vocab]
-            mtp_log_probs_flat = mtp_log_probs.view(-1, mtp_log_probs.size(-1))
-            teacher_probs_flat = teacher_probs.view(-1, teacher_probs.size(-1))
-            
             loss = kl_loss_fn(mtp_log_probs_flat, teacher_probs_flat)
             
             # For logging: calculate how often MTP top-1 matches Teacher top-1
