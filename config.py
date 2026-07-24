@@ -7,11 +7,11 @@ class TrainingConfig:
     # Model Configuration
     base_model_name: str = "Nanbeige/Nanbeige4.2-3B"
     
-    # Dataset Configuration
-    dataset_name: str = "HuggingFaceFW/fineweb-edu"
-    dataset_config: Optional[str] = "sample-10BT"
+    # Dataset Configuration (Default to lightweight wikitext-2-raw-v1 ~2.5MB for fast Kaggle runs)
+    dataset_name: str = "wikitext"
+    dataset_config: Optional[str] = "wikitext-2-raw-v1"
     max_seq_len: int = 1024
-    max_samples: int = 100000
+    max_samples: int = 5000
     
     # MTP Architecture Parameters
     num_mtp_layers: int = 1
