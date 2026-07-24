@@ -121,6 +121,18 @@ def train():
         hidden_size=hidden_size,
         base_layer=base_model.model.layers[-1]
     ).to(device=device, dtype=torch.float32)  # Force MTP head to FP32 to completely avoid NaN overflows
+    
+    # 2.5 Resume from Checkpoint if requested
+    checkpoint_path = os.path.join(config.checkpoint_dir, "nanbeige_mtp_head.pt")
+    if config.resume_from_checkpoint and os.path.exists(checkpoint_path):
+        if is_main_process:
+            print(f"=== Resuming training from checkpoint: {checkpoint_path} ===")
+        
+        # Load weights (map_location ensures they load onto the correct GPU for DDP)
+        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        mtp_module.load_state_dict(state_dict)
+        if is_main_process:
+            print("=== Successfully loaded checkpoint weights! ===")
 
 
     # Wrap MTP module in PyTorch DDP for multi-GPU synchronization

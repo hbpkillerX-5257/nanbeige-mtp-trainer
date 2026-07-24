@@ -13,6 +13,10 @@ class TrainingConfig:
     max_seq_len: int = 1024
     max_samples: int = 5000
     
+    # Checkpointing
+    resume_from_checkpoint: bool = True
+    checkpoint_dir: str = "./mtp_output"
+    
     # MTP Architecture Parameters
     num_mtp_layers: int = 1
     num_heads: int = 8
