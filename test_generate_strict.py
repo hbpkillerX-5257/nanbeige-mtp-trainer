@@ -24,7 +24,7 @@ def run():
     model = AutoModelForCausalLM.from_pretrained(
         model_name, 
         config=model_config,
-        torch_dtype=torch.float32, 
+        torch_dtype=torch.bfloat16, 
         trust_remote_code=True,
         device_map={"": device}
     )
