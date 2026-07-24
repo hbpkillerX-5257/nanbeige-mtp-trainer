@@ -49,7 +49,8 @@ def get_dataloader(config, tokenizer, local_rank=0, world_size=1):
             padding=True,
             truncation=True,
             max_length=config.max_seq_len + 2,
-            return_tensors="pt"
+            return_tensors="pt",
+            add_special_tokens=False
         )
         return encodings["input_ids"]
 
