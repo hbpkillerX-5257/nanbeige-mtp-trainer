@@ -5,12 +5,13 @@ from pathlib import Path
 # Add package directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-# Remove flash_attn if present
+# 1. UNINSTALL BROKEN FLASH_ATTN FROM PYTHON MEMORY
 for mod_name in list(sys.modules.keys()):
     if mod_name.startswith("flash_attn"):
         del sys.modules[mod_name]
 sys.modules["flash_attn"] = None
 
+# 2. DISABLE TRANSFORMERS CHECKS
 import transformers.utils.import_utils
 transformers.utils.import_utils.is_flash_attn_2_available = lambda: False
 import transformers.dynamic_module_utils
@@ -91,7 +92,7 @@ def train(resume: bool = False):
         os.makedirs(config.output_dir, exist_ok=True)
 
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float16 if config.mixed_precision == "fp16" else torch.bfloat16
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     # 1. Load Tokenizer & Base Model
     if is_main_process:
@@ -104,14 +105,10 @@ def train(resume: bool = False):
     # Load Config and patch rope_scaling for newer transformers compatibility
     from transformers import AutoConfig
     model_config = AutoConfig.from_pretrained(config.base_model_name, trust_remote_code=True)
-    if hasattr(model_config, "rope_scaling") and model_config.rope_scaling is not None:
+    if hasattr(model_config, "rope_scaling") and model_config.rope_scaling:
         if isinstance(model_config.rope_scaling, dict):
-            rope_type = model_config.rope_scaling.get("type", model_config.rope_scaling.get("rope_type", None))
-            if rope_type is None or rope_type == "default":
-                model_config.rope_scaling = None
-            else:
-                model_config.rope_scaling.setdefault("type", rope_type)
-                model_config.rope_scaling.setdefault("factor", 1.0)
+            model_config.rope_scaling["type"] = "linear"
+            model_config.rope_scaling["factor"] = 1.0
 
     # Load base model on current GPU rank
     base_model = AutoModelForCausalLM.from_pretrained(
