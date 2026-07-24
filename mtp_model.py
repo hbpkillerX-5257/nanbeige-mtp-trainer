@@ -23,6 +23,13 @@ class MTPModule(nn.Module):
         self.ffn_up   = nn.Linear(hidden_size, ffn_dim, bias=False)
         self.ffn_down = nn.Linear(ffn_dim, hidden_size, bias=False)
 
+        self._init_weights()
+
+    def _init_weights(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.normal_(p, mean=0.0, std=0.02)
+
     def forward(self, h_t: torch.Tensor, emb_next: torch.Tensor) -> torch.Tensor:
         # Concatenate hidden state and embedding along feature dimension
         x = torch.cat([h_t, emb_next], dim=-1)

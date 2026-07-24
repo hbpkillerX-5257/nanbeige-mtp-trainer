@@ -168,9 +168,9 @@ def train():
             # Forward pass through MTP module
             mtp_features = mtp_module(h_t, emb_next)
 
-            # Compute logits using base model LM Head (shared weights)
+            # Compute logits using base model LM Head in float32 for numerical stability
             lm_head = base_model.get_output_embeddings()
-            mtp_logits = lm_head(mtp_features)  # [B, S-1, Vocab]
+            mtp_logits = lm_head(mtp_features).to(torch.float32)  # [B, S-1, Vocab]
 
             # Cross-Entropy Loss
             loss = F.cross_entropy(
@@ -178,16 +178,18 @@ def train():
                 targets.reshape(-1),
                 ignore_index=tokenizer.pad_token_id
             )
-            loss = loss / config.gradient_accumulation_steps
-            loss.backward()
+            
+            scaled_loss = loss / config.gradient_accumulation_steps
+            scaled_loss.backward()
 
             if (step + 1) % config.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(mtp_module.parameters(), max_norm=1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
                 if is_main_process:
                     pbar.set_postfix({
-                        "loss": loss.item() * config.gradient_accumulation_steps,
+                        "loss": round(loss.item(), 4),
                         "lr": scheduler.get_last_lr()[0]
                     })
 
