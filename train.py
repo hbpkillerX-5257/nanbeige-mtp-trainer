@@ -103,8 +103,9 @@ def train():
         config.base_model_name,
         config=model_config,
         torch_dtype=dtype,
-        trust_remote_code=True
-    ).to(device)
+        trust_remote_code=True,
+        device_map={"": device}
+    )
 
     # Freeze Base Model parameters completely
     for p in base_model.parameters():
@@ -157,7 +158,11 @@ def train():
             with torch.no_grad():
                 outputs = base_model(input_ids, output_hidden_states=True, use_cache=False)
                 # Hidden states h_t: [B, S-1, D]
-                h_t = outputs.hidden_states[-1][:, :-1, :]
+                h_t = outputs.hidden_states[-1][:, :-1, :].clone().detach()
+                
+                # Immediately free the base model outputs (which contains 44 layers of hidden states and logits)
+                del outputs
+                torch.cuda.empty_cache()
                 
                 # Token embeddings e(y_t): [B, S-1, D]
                 embed_layer = base_model.get_input_embeddings()

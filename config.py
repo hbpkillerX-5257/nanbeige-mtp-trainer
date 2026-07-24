@@ -19,8 +19,8 @@ class TrainingConfig:
     ffn_dim: int = 10752
     
     # Training Hyperparameters
-    batch_size_per_gpu: int = 2
-    gradient_accumulation_steps: int = 4
+    batch_size_per_gpu: int = 1
+    gradient_accumulation_steps: int = 8
     learning_rate: float = 5e-4
     weight_decay: float = 0.01
     warmup_steps: int = 100
