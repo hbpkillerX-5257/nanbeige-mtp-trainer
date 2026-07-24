@@ -173,15 +173,21 @@ def train():
 
             # Forward pass through MTP module in explicit float32
             mtp_features = mtp_module(h_t.to(torch.float32), emb_next.to(torch.float32))
+            
+            # Delete intermediate tensors to free VRAM for backward pass
+            del h_t
+            del emb_next
 
-            # Compute logits using base model LM Head in float32 for numerical stability
+            # Compute logits using base model LM Head in float16 to save 2.04 GB of VRAM!
             lm_head = base_model.get_output_embeddings()
-            # Explicit FP32 linear projection to avoid any fp16 overflow
-            mtp_logits = F.linear(mtp_features, lm_head.weight.to(torch.float32))  # [B, S-1, Vocab]
+            
+            # We cast mtp_features back to fp16 for the massive (166400, 3072) projection 
+            # to prevent creating a 2.04 GB FP32 vocabulary weight tensor!
+            mtp_logits = F.linear(mtp_features.to(torch.float16), lm_head.weight)  # [B, S-1, Vocab]
 
-            # Cross-Entropy Loss
+            # Cross-Entropy Loss (we cast logits to float32 for numerical stability in the softmax)
             loss = F.cross_entropy(
-                mtp_logits.view(-1, vocab_size),
+                mtp_logits.to(torch.float32).view(-1, vocab_size),
                 targets.reshape(-1),
                 ignore_index=tokenizer.pad_token_id
             )
@@ -191,6 +197,11 @@ def train():
             
             scaled_loss = loss / config.gradient_accumulation_steps
             scaled_loss.backward()
+            
+            # Delete massive logits tensor immediately after backward graph is populated
+            del mtp_logits
+            del mtp_features
+            torch.cuda.empty_cache()
 
             if (step + 1) % config.gradient_accumulation_steps == 0:
                 torch.nn.utils.clip_grad_norm_(mtp_module.parameters(), max_norm=1.0)
