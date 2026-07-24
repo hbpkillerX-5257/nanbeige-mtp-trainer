@@ -160,6 +160,10 @@ def train():
                 # Hidden states h_t (for step t): [B, S-2, D]
                 h_t = outputs.hidden_states[-1][:, :-2, :].clone().detach()
                 
+                # KD TARGET: Teacher's probability distribution for t+2
+                # outputs.logits[i] predicts token i+1. So index 1 predicts token 2 (t+2)
+                target_logits = outputs.logits[:, 1:-1, :].clone().detach()
+                
                 # Immediately free the base model outputs (which contains 44 layers of hidden states and logits)
                 del outputs
                 torch.cuda.empty_cache()
@@ -168,30 +172,31 @@ def train():
                 embed_layer = base_model.get_input_embeddings()
                 emb_next = embed_layer(input_ids[:, 1:-1])
 
-                # Targets y_{t+2} (the next-next token): [B, S-2]
-                targets = input_ids[:, 2:]
-
             # Forward pass through MTP module in explicit float32
             mtp_features = mtp_module(h_t.to(torch.float32), emb_next.to(torch.float32))
             
-            # Delete intermediate tensors to free VRAM for backward pass
-            del h_t
-            del emb_next
-
-            # Compute logits using base model LM Head in float16 to save 2.04 GB of VRAM!
+            # Predict MTP logits (cast to float16 to save 2.04 GB of VRAM on Kaggle T4!)
             lm_head = base_model.get_output_embeddings()
+            mtp_logits = F.linear(mtp_features.to(torch.float16), lm_head.weight)
             
-            # We cast mtp_features back to fp16 for the massive (166400, 3072) projection 
-            # to prevent creating a 2.04 GB FP32 vocabulary weight tensor!
-            mtp_logits = F.linear(mtp_features.to(torch.float16), lm_head.weight)  # [B, S-1, Vocab]
-
-            # Cross-Entropy Loss (we cast logits to float32 for numerical stability in the softmax)
-            loss = F.cross_entropy(
-                mtp_logits.to(torch.float32).view(-1, vocab_size),
-                targets.reshape(-1),
-                ignore_index=tokenizer.pad_token_id
-            )
+            # KNOWLEDGE DISTILLATION LOSS (KL-Divergence)
+            # PyTorch KLDiv expects log-probs for predictions, and standard probs for targets.
+            mtp_log_probs = F.log_softmax(mtp_logits.to(torch.float32), dim=-1)
+            teacher_probs = F.softmax(target_logits.to(torch.float32), dim=-1)
             
+            kl_loss_fn = nn.KLDivLoss(reduction="batchmean")
+            
+            # Flatten to [N, Vocab]
+            mtp_log_probs_flat = mtp_log_probs.view(-1, mtp_log_probs.size(-1))
+            teacher_probs_flat = teacher_probs.view(-1, teacher_probs.size(-1))
+            
+            loss = kl_loss_fn(mtp_log_probs_flat, teacher_probs_flat)
+            
+            # For logging: calculate how often MTP top-1 matches Teacher top-1
+            teacher_preds = torch.argmax(teacher_probs_flat, dim=-1)
+            mtp_preds = torch.argmax(mtp_log_probs_flat, dim=-1)
+            correct_tokens = (mtp_preds == teacher_preds).sum().item()
+            total_tokens = teacher_preds.numel()
             if torch.isnan(loss) or torch.isinf(loss):
                 continue
             
@@ -201,6 +206,11 @@ def train():
             # Delete massive logits tensor immediately after backward graph is populated
             del mtp_logits
             del mtp_features
+            del target_logits
+            del mtp_log_probs
+            del teacher_probs
+            del mtp_log_probs_flat
+            del teacher_probs_flat
             torch.cuda.empty_cache()
 
             if (step + 1) % config.gradient_accumulation_steps == 0:
