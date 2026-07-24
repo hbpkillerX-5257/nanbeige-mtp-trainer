@@ -156,6 +156,7 @@ def train():
 
             # Forward pass through base model (no gradients or KV cache needed)
             with torch.no_grad():
+                outputs = base_model(input_ids, output_hidden_states=True, use_cache=False)
                 # Hidden states h_t (for step t): [B, S-2, D]
                 h_t = outputs.hidden_states[-1][:, :-2, :].clone().detach()
                 
