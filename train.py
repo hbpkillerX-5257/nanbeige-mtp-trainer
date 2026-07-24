@@ -19,6 +19,23 @@ from mtp_model import MTPModule
 from dataset import get_dataloader
 
 
+# Monkey-patch DynamicCache.from_legacy_cache for newer transformers compatibility
+import transformers.cache_utils
+if not hasattr(transformers.cache_utils.DynamicCache, "from_legacy_cache"):
+    @classmethod
+    def from_legacy_cache(cls, past_key_values=None):
+        if past_key_values is None:
+            return cls()
+        if isinstance(past_key_values, cls):
+            return past_key_values
+        cache = cls()
+        if past_key_values is not None:
+            for layer_idx, (key_states, value_states) in enumerate(past_key_values):
+                cache.update(key_states, value_states, layer_idx)
+        return cache
+    transformers.cache_utils.DynamicCache.from_legacy_cache = from_legacy_cache
+
+
 def init_distributed():
     """
     Initialize Distributed Data Parallel (DDP) for torchrun / multi-GPU training.
