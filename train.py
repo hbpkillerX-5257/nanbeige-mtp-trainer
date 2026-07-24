@@ -119,7 +119,8 @@ def train():
         hidden_size=hidden_size,
         num_heads=config.num_heads,
         ffn_dim=config.ffn_dim
-    ).to(device=device, dtype=dtype)
+    ).to(device=device, dtype=torch.float32)  # Force MTP head to FP32 to completely avoid NaN overflows
+
 
     # Wrap MTP module in PyTorch DDP for multi-GPU synchronization
     if world_size > 1:
@@ -165,12 +166,13 @@ def train():
                 # Targets y_{t+1}: [B, S-1]
                 targets = input_ids[:, 1:]
 
-            # Forward pass through MTP module
-            mtp_features = mtp_module(h_t, emb_next)
+            # Forward pass through MTP module in explicit float32
+            mtp_features = mtp_module(h_t.to(torch.float32), emb_next.to(torch.float32))
 
             # Compute logits using base model LM Head in float32 for numerical stability
             lm_head = base_model.get_output_embeddings()
-            mtp_logits = lm_head(mtp_features).to(torch.float32)  # [B, S-1, Vocab]
+            # Explicit FP32 linear projection to avoid any fp16 overflow
+            mtp_logits = F.linear(mtp_features, lm_head.weight.to(torch.float32))  # [B, S-1, Vocab]
 
             # Cross-Entropy Loss
             loss = F.cross_entropy(
@@ -178,6 +180,9 @@ def train():
                 targets.reshape(-1),
                 ignore_index=tokenizer.pad_token_id
             )
+            
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
             
             scaled_loss = loss / config.gradient_accumulation_steps
             scaled_loss.backward()
