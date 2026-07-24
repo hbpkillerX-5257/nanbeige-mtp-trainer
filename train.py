@@ -64,8 +64,12 @@ def train():
     model_config = AutoConfig.from_pretrained(config.base_model_name, trust_remote_code=True)
     if hasattr(model_config, "rope_scaling") and model_config.rope_scaling is not None:
         if isinstance(model_config.rope_scaling, dict):
-            if "type" not in model_config.rope_scaling:
-                model_config.rope_scaling["type"] = model_config.rope_scaling.get("rope_type", "linear")
+            rope_type = model_config.rope_scaling.get("type", model_config.rope_scaling.get("rope_type", None))
+            if rope_type is None or rope_type == "default":
+                model_config.rope_scaling = None
+            else:
+                model_config.rope_scaling.setdefault("type", rope_type)
+                model_config.rope_scaling.setdefault("factor", 1.0)
 
     # Load base model on current GPU rank
     base_model = AutoModelForCausalLM.from_pretrained(
