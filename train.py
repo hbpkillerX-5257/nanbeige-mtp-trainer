@@ -19,7 +19,7 @@ from mtp_model import MTPModule
 from dataset import get_dataloader
 
 
-# Monkey-patch DynamicCache.from_legacy_cache for newer transformers compatibility
+# Monkey-patch DynamicCache.from_legacy_cache and to_legacy_cache for newer transformers compatibility
 import transformers.cache_utils
 if not hasattr(transformers.cache_utils.DynamicCache, "from_legacy_cache"):
     @classmethod
@@ -34,6 +34,14 @@ if not hasattr(transformers.cache_utils.DynamicCache, "from_legacy_cache"):
                 cache.update(key_states, value_states, layer_idx)
         return cache
     transformers.cache_utils.DynamicCache.from_legacy_cache = from_legacy_cache
+
+if not hasattr(transformers.cache_utils.DynamicCache, "to_legacy_cache"):
+    def to_legacy_cache(self):
+        legacy_cache = ()
+        for layer_idx in range(len(self.key_cache)):
+            legacy_cache += ((self.key_cache[layer_idx], self.value_cache[layer_idx]),)
+        return legacy_cache
+    transformers.cache_utils.DynamicCache.to_legacy_cache = to_legacy_cache
 
 
 def init_distributed():
