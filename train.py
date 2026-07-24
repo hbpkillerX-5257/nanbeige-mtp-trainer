@@ -194,10 +194,9 @@ def train(resume: bool = False):
             # Forward pass through MTP module in explicit float32
             mtp_features = mtp_module(h_t.to(torch.float32), emb_next.to(torch.float32))
             
-            # Predict MTP logits (cast to float16 to save 2.04 GB of VRAM on Kaggle T4!)
+            # Predict MTP logits (cast down from fp32 to base model dtype to save 2.04 GB of VRAM!)
             lm_head = base_model.get_output_embeddings()
-            mtp_logits = F.linear(mtp_features.to(torch.float16), lm_head.weight)
-            
+            mtp_logits = F.linear(mtp_features.to(lm_head.weight.dtype), lm_head.weight)            
             # KNOWLEDGE DISTILLATION LOSS (KL-Divergence)
             # PyTorch KLDiv expects log-probs for predictions, and standard probs for targets.
             mtp_log_probs = F.log_softmax(mtp_logits.to(torch.float32), dim=-1)

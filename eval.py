@@ -76,7 +76,7 @@ def evaluate_acceptance_rate(
         
         # Compute MTP logits
         lm_head = base_model.get_output_embeddings()
-        mtp_logits = F.linear(mtp_features.to(torch.float16), lm_head.weight)
+        mtp_logits = F.linear(mtp_features.to(lm_head.weight.dtype), lm_head.weight)
         mtp_preds = torch.argmax(mtp_logits, dim=-1) # [1, seq_len-2]
         
         # Alignment:
