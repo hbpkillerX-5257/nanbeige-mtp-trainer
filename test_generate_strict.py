@@ -49,9 +49,12 @@ def run():
         print("\n--- Diagnostic Analysis ---")
         print(f"Logits shape: {logits.shape}")
         
-        # Check for NaNs
-        print(f"NaNs in hidden states: {torch.isnan(hidden).any().item()}")
-        print(f"NaNs in logits: {torch.isnan(logits).any().item()}")
+        # Check weights
+        embed_w = model.model.embed_tokens.weight
+        lm_head_w = model.lm_head.weight
+        print(f"\nEmbed weight mean: {embed_w.mean().item():.5f}, std: {embed_w.std().item():.5f}")
+        print(f"lm_head weight mean: {lm_head_w.mean().item():.5f}, std: {lm_head_w.std().item():.5f}")
+        print(f"Are they tied? {embed_w.data_ptr() == lm_head_w.data_ptr()}")
         
         # Check if hidden states change across positions
         h_diffs = []
