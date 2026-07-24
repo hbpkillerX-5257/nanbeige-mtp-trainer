@@ -24,9 +24,10 @@ def run():
     model = AutoModelForCausalLM.from_pretrained(
         model_name, 
         config=model_config,
-        torch_dtype=torch.bfloat16, 
+        torch_dtype=torch.float16, 
         trust_remote_code=True,
-        device_map={"": device}
+        device_map={"": device},
+        attn_implementation="eager"
     )
     model.eval()
 
@@ -45,9 +46,7 @@ def run():
             pred = tokenizer.decode([p.item()])
             print(f"Token {i} | Context: {repr(ctx)} | Predicts: {repr(pred)}")
             
-        print("\nLet's try model.generate() to see if it predicts something normal:")
-        gen = model.generate(**inputs, max_new_tokens=10, do_sample=False, pad_token_id=tokenizer.eos_token_id)
-        print("Generated:", tokenizer.decode(gen[0]))
+        print("\nSkipping .generate() due to HuggingFace DynamicCache version incompatibility.")
 
 if __name__ == "__main__":
     run()
