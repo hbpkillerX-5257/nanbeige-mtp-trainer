@@ -7,9 +7,9 @@ class TrainingConfig:
     # Model Configuration
     base_model_name: str = "Nanbeige/Nanbeige4.2-3B"
     
-    # Dataset Configuration (Default to lightweight wikitext-2-raw-v1 ~2.5MB for fast Kaggle runs)
-    dataset_name: str = "wikitext"
-    dataset_config: Optional[str] = "wikitext-2-raw-v1"
+    # Dataset Configuration (Default to Alpaca for Instruction/QnA models)
+    dataset_name: str = "tatsu-lab/alpaca"
+    dataset_config: Optional[str] = None
     max_seq_len: int = 1024
     max_samples: int = 5000
     

@@ -18,13 +18,30 @@ def get_dataloader(config, tokenizer, local_rank=0, world_size=1):
         print(f"Fallback to wikitext dataset due to load error: {e}")
         raw_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 
-    # Extract non-empty text sequences
+    # Extract non-empty text sequences (Support QnA / Instruct formats)
     texts = []
-    text_key = "text" if "text" in raw_dataset.column_names else raw_dataset.column_names[0]
+    
+    # Check if dataset has instruct columns
+    is_instruct = "instruction" in raw_dataset.column_names and "output" in raw_dataset.column_names
+    
     for row in raw_dataset:
-        val = row[text_key]
-        if isinstance(val, str) and len(val.strip()) > 40:
-            texts.append(val)
+        if is_instruct:
+            # Format as a chat conversation
+            messages = [
+                {"role": "user", "content": f"{row['instruction']}\n{row.get('input', '')}".strip()},
+                {"role": "assistant", "content": row["output"]}
+            ]
+            try:
+                text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            except Exception:
+                # Fallback if tokenizer lacks chat template
+                text = f"User: {messages[0]['content']}\n\nAssistant: {messages[1]['content']}"
+        else:
+            text_key = "text" if "text" in raw_dataset.column_names else raw_dataset.column_names[0]
+            text = row[text_key]
+            
+        if isinstance(text, str) and len(text.strip()) > 40:
+            texts.append(text)
 
     def collate_fn(batch):
         encodings = tokenizer(
