@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pt
+*.safetensors
+*.bin
+mtp_output/
+.DS_Store
+.vscode/
+.idea/
