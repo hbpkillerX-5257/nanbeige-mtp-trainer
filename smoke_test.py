@@ -78,7 +78,9 @@ def run_smoke_test():
             torch.cuda.empty_cache()
             
         except Exception as e:
-            print(f"[{name}] FAILED to load or run: {e}")
+            import traceback
+            print(f"\n[{name}] FAILED to load or run:")
+            traceback.print_exc()
 
 if __name__ == "__main__":
     run_smoke_test()
