@@ -5,7 +5,7 @@ from typing import Optional
 @dataclass
 class TrainingConfig:
     # Model Configuration
-    base_model_name: str = "Nanbeige/Nanbeige4.2-3B-Chat"
+    base_model_name: str = "Nanbeige/Nanbeige4.2-3B"
     
     # Dataset Configuration
     dataset_name: str = "HuggingFaceFW/fineweb-edu"
