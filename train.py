@@ -5,6 +5,17 @@ from pathlib import Path
 # Add package directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Remove flash_attn if present
+for mod_name in list(sys.modules.keys()):
+    if mod_name.startswith("flash_attn"):
+        del sys.modules[mod_name]
+sys.modules["flash_attn"] = None
+
+import transformers.utils.import_utils
+transformers.utils.import_utils.is_flash_attn_2_available = lambda: False
+import transformers.dynamic_module_utils
+transformers.dynamic_module_utils.check_imports = lambda filename: []
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

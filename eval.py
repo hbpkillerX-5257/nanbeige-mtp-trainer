@@ -1,3 +1,14 @@
+import sys
+for mod_name in list(sys.modules.keys()):
+    if mod_name.startswith("flash_attn"):
+        del sys.modules[mod_name]
+sys.modules["flash_attn"] = None
+
+import transformers.utils.import_utils
+transformers.utils.import_utils.is_flash_attn_2_available = lambda: False
+import transformers.dynamic_module_utils
+transformers.dynamic_module_utils.check_imports = lambda filename: []
+
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
@@ -28,7 +39,7 @@ def evaluate_acceptance_rate(
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name, 
         config=model_config,
-        torch_dtype=torch.bfloat16, 
+        torch_dtype=torch.float32, 
         trust_remote_code=True,
         device_map={"": device}
     )
@@ -50,10 +61,16 @@ def evaluate_acceptance_rate(
     print("=== Running Evaluation ===")
     inputs = tokenizer(text_sample, return_tensors="pt").to(device)
     input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
     
     with torch.no_grad():
         # Get base model outputs
-        outputs = base_model(input_ids, output_hidden_states=True, use_cache=False)
+        outputs = base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=False
+        )
         
         # Base model predictions for next token
         # logits shape: [1, seq_len, vocab_size]
