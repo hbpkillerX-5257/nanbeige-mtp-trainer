@@ -36,10 +36,10 @@ def evaluate_acceptance_rate(
 
     print(f"=== Loading MTP Head from {mtp_weights_path} ===")
     config = TrainingConfig()
+    # Initialize MTP module
     mtp_module = MTPModule(
         hidden_size=base_model.config.hidden_size,
-        num_heads=config.num_heads,
-        ffn_dim=config.ffn_dim
+        base_layer=base_model.model.layers[-1]
     ).to(device=device, dtype=torch.float32)
     
     # Load PyTorch weights

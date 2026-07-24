@@ -116,10 +116,10 @@ def train():
     vocab_size = base_model.config.vocab_size
 
     # 2. Instantiate MTP Module
+    # Initialize MTP module by explicitly cloning the base model's last layer
     mtp_module = MTPModule(
         hidden_size=hidden_size,
-        num_heads=config.num_heads,
-        ffn_dim=config.ffn_dim
+        base_layer=base_model.model.layers[-1]
     ).to(device=device, dtype=torch.float32)  # Force MTP head to FP32 to completely avoid NaN overflows
 
 
