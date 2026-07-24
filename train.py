@@ -59,9 +59,18 @@ def train():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Load Config and patch rope_scaling for newer transformers compatibility
+    from transformers import AutoConfig
+    model_config = AutoConfig.from_pretrained(config.base_model_name, trust_remote_code=True)
+    if hasattr(model_config, "rope_scaling") and model_config.rope_scaling is not None:
+        if isinstance(model_config.rope_scaling, dict):
+            if "type" not in model_config.rope_scaling:
+                model_config.rope_scaling["type"] = model_config.rope_scaling.get("rope_type", "linear")
+
     # Load base model on current GPU rank
     base_model = AutoModelForCausalLM.from_pretrained(
         config.base_model_name,
+        config=model_config,
         torch_dtype=dtype,
         trust_remote_code=True
     ).to(device)
