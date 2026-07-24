@@ -66,8 +66,12 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-def train():
+def train(resume: bool = False):
     config = TrainingConfig()
+    
+    # Override config with command line args if specified
+    if resume:
+        config.resume_from_checkpoint = True
     rank, local_rank, world_size = init_distributed()
     is_main_process = (rank == 0)
 
@@ -267,4 +271,9 @@ def train():
 
 
 if __name__ == "__main__":
-    train()
+    import argparse
+    parser = argparse.ArgumentParser(description="Train MTP Head for Nanbeige")
+    parser.add_argument("--resume", action="store_true", help="Resume training from the latest checkpoint if it exists")
+    args = parser.parse_args()
+    
+    train(resume=args.resume)
