@@ -31,7 +31,12 @@ def run():
     )
     model.eval()
 
-    text = "The history of artificial intelligence began in antiquity, with"
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Tell me about the history of artificial intelligence."}
+    ]
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    print(f"\nTesting with formatted prompt:\n{repr(text)}")
     inputs = tokenizer(text, return_tensors="pt").to(device)
 
     with torch.no_grad():
