@@ -19,6 +19,17 @@ def run_smoke_test():
     for i, tok_id in enumerate(inputs['input_ids'][0]):
         print(f"  Token {i}: {tok_id.item()} -> '{tokenizer.decode([tok_id.item()])}'")
         
+    from transformers import AutoConfig
+    model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    if hasattr(model_config, "rope_scaling") and model_config.rope_scaling is not None:
+        if isinstance(model_config.rope_scaling, dict):
+            rope_type = model_config.rope_scaling.get("type", model_config.rope_scaling.get("rope_type", None))
+            if rope_type is None or rope_type == "default":
+                model_config.rope_scaling = None
+            else:
+                model_config.rope_scaling.setdefault("type", rope_type)
+                model_config.rope_scaling.setdefault("factor", 1.0)
+
     dtypes_to_test = {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
@@ -30,7 +41,8 @@ def run_smoke_test():
         print(f"\n\n--- Test: Base Model in {name} ---")
         try:
             model = AutoModelForCausalLM.from_pretrained(
-                model_name, 
+                model_name,
+                config=model_config,
                 torch_dtype=dtype, 
                 trust_remote_code=True,
                 device_map={"": device}
