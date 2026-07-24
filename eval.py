@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from mtp_model import MTPModule
-from config import MTPConfig
+from config import TrainingConfig
 from tqdm import tqdm
 
 def evaluate_acceptance_rate(
@@ -35,7 +35,7 @@ def evaluate_acceptance_rate(
     base_model.eval()
 
     print(f"=== Loading MTP Head from {mtp_weights_path} ===")
-    config = MTPConfig()
+    config = TrainingConfig()
     mtp_module = MTPModule(
         hidden_size=base_model.config.hidden_size,
         num_heads=config.num_heads,
