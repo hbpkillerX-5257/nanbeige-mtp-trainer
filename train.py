@@ -156,20 +156,19 @@ def train():
 
             # Forward pass through base model (no gradients or KV cache needed)
             with torch.no_grad():
-                outputs = base_model(input_ids, output_hidden_states=True, use_cache=False)
-                # Hidden states h_t: [B, S-1, D]
-                h_t = outputs.hidden_states[-1][:, :-1, :].clone().detach()
+                # Hidden states h_t (for step t): [B, S-2, D]
+                h_t = outputs.hidden_states[-1][:, :-2, :].clone().detach()
                 
                 # Immediately free the base model outputs (which contains 44 layers of hidden states and logits)
                 del outputs
                 torch.cuda.empty_cache()
                 
-                # Token embeddings e(y_t): [B, S-1, D]
+                # Token embeddings e(y_{t+1}) (the actual next token): [B, S-2, D]
                 embed_layer = base_model.get_input_embeddings()
-                emb_next = embed_layer(input_ids[:, :-1])
+                emb_next = embed_layer(input_ids[:, 1:-1])
 
-                # Targets y_{t+1}: [B, S-1]
-                targets = input_ids[:, 1:]
+                # Targets y_{t+2} (the next-next token): [B, S-2]
+                targets = input_ids[:, 2:]
 
             # Forward pass through MTP module in explicit float32
             mtp_features = mtp_module(h_t.to(torch.float32), emb_next.to(torch.float32))

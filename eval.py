@@ -60,18 +60,16 @@ def evaluate_acceptance_rate(
         base_logits = outputs.logits
         base_preds = torch.argmax(base_logits, dim=-1) # [1, seq_len]
         
-        # Hidden states h_t: [1, seq_len-1, D] (we drop the last hidden state since it predicts out of bounds)
-        h_t = outputs.hidden_states[-1][:, :-1, :]
+        # Hidden states h_t (for step t): [1, seq_len-2, D] 
+        h_t = outputs.hidden_states[-1][:, :-2, :]
         
-        # Token embeddings e(y_{t+1}): [1, seq_len-1, D]
+        # Token embeddings e(y_{t+1}): [1, seq_len-2, D]
         embed_layer = base_model.get_input_embeddings()
         
         # In speculative decoding, we use the base model's prediction as the proposed y_{t+1}
-        # But for exact accuracy, let's assume y_{t+1} is given correctly by the base model (Teacher Forcing)
-        # We will test: if the base model predicts token X for t+1, what does MTP predict for t+2?
-        
-        proposed_next_tokens = base_preds[:, :-1] # [1, seq_len-1]
-        emb_next = embed_layer(proposed_next_tokens)
+        # But for exact accuracy, we use the ground truth token at t+1 just like training.
+        # This isolates MTP's accuracy without compounding base model errors.
+        emb_next = embed_layer(input_ids[:, 1:-1])
         
         # Forward pass through MTP module
         mtp_features = mtp_module(h_t.to(torch.float32), emb_next.to(torch.float32))
@@ -79,12 +77,12 @@ def evaluate_acceptance_rate(
         # Compute MTP logits
         lm_head = base_model.get_output_embeddings()
         mtp_logits = F.linear(mtp_features.to(torch.float16), lm_head.weight)
-        mtp_preds = torch.argmax(mtp_logits, dim=-1) # [1, seq_len-1]
+        mtp_preds = torch.argmax(mtp_logits, dim=-1) # [1, seq_len-2]
         
         # Alignment:
-        # Base model prediction for step t+2 is base_preds[:, 1:]
-        # MTP prediction for step t+2 (given h_t and base_preds[t+1]) is mtp_preds
-        target_base_preds = base_preds[:, 1:]
+        # Base model prediction for step t+2 is base_preds[:, 1:-1] (since base_preds[i] predicts t+i+1)
+        # MTP prediction for step t+2 is mtp_preds
+        target_base_preds = base_preds[:, 1:-1]
         
         correct = (mtp_preds == target_base_preds).sum().item()
         total = target_base_preds.numel()
