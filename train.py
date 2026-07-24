@@ -38,8 +38,10 @@ if not hasattr(transformers.cache_utils.DynamicCache, "from_legacy_cache"):
 if not hasattr(transformers.cache_utils.DynamicCache, "to_legacy_cache"):
     def to_legacy_cache(self):
         legacy_cache = ()
-        for layer_idx in range(len(self.key_cache)):
-            legacy_cache += ((self.key_cache[layer_idx], self.value_cache[layer_idx]),)
+        keys = getattr(self, "key_cache", getattr(self, "_key_cache", []))
+        values = getattr(self, "value_cache", getattr(self, "_value_cache", []))
+        for layer_idx in range(len(keys)):
+            legacy_cache += ((keys[layer_idx], values[layer_idx]),)
         return legacy_cache
     transformers.cache_utils.DynamicCache.to_legacy_cache = to_legacy_cache
 
@@ -150,9 +152,9 @@ def train():
             if input_ids.shape[1] < 4:
                 continue
 
-            # Forward pass through base model (no gradients needed)
+            # Forward pass through base model (no gradients or KV cache needed)
             with torch.no_grad():
-                outputs = base_model(input_ids, output_hidden_states=True)
+                outputs = base_model(input_ids, output_hidden_states=True, use_cache=False)
                 # Hidden states h_t: [B, S-1, D]
                 h_t = outputs.hidden_states[-1][:, :-1, :]
                 
