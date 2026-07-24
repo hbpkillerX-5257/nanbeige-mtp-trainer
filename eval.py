@@ -28,7 +28,7 @@ def evaluate_acceptance_rate(
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name, 
         config=model_config,
-        torch_dtype=torch.float16, 
+        torch_dtype=torch.bfloat16, 
         trust_remote_code=True,
         device_map={"": device}
     )
