@@ -44,6 +44,10 @@ def run():
         print("\n--- Diagnostic Analysis ---")
         print(f"Logits shape: {logits.shape}")
         
+        # Check for NaNs
+        print(f"NaNs in hidden states: {torch.isnan(hidden).any().item()}")
+        print(f"NaNs in logits: {torch.isnan(logits).any().item()}")
+        
         # Check if hidden states change across positions
         h_diffs = []
         for i in range(1, hidden.shape[0]):
