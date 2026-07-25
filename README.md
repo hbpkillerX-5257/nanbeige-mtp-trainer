@@ -1,6 +1,12 @@
 # Nanbeige 4.2 3B Multi-Token Prediction (MTP) Trainer
 
-A lightweight PyTorch repository for training a **Multi-Token Prediction (MTP)** head on top of Nanbeige 4.2 3B using Distributed Data Parallel (**DDP** / **`torchrun`**) across **2x NVIDIA T4 GPUs** (Kaggle or local).
+A lightweight PyTorch repository for training a **Multi-Token Prediction (MTP)** head on top of Nanbeige 4.2 3B using Distributed Data Parallel (**DDP** / **`torchrun`**).
+
+> **BF16 hardware is required.** Nanbeige4.2 is published as a BF16 model and
+> its teacher predictions collapse when forced to FP16 on NVIDIA T4 GPUs.
+> Use BF16-capable GPUs such as A100, L4, A10, or newer. The trainer now fails
+> before loading the model when BF16 is unavailable and also runs a teacher
+> health check before the first training batch.
 
 ---
 
@@ -21,10 +27,10 @@ nanbeige_mtp_trainer/
 
 ---
 
-## 🚀 How to Run on Kaggle (2x Tesla T4 GPUs)
+## 🚀 How to Run
 
 ### Step 1: Copy Package to Kaggle Notebook
-Upload or clone `nanbeige_mtp_trainer` into your Kaggle Notebook directory.
+Upload or clone `nanbeige_mtp_trainer` into your notebook or working directory.
 
 ### Step 2: Run Multi-GPU Training (`torchrun`)
 
@@ -56,6 +62,11 @@ projections use the model dtype, while normalization, KL accumulation, and
 gradient accumulation use FP32. This keeps the exact teacher distribution while
 avoiding full `[tokens, vocabulary]` probability tensors.
 `kd_vocab_chunk_size` in `config.py` controls the memory/throughput tradeoff.
+
+For instruction datasets such as Alpaca, loss is computed only for target
+tokens in the assistant answer. System and user prompt tokens provide context
+but do not contribute to the distillation loss. Plain-text datasets continue to
+train on all non-padding tokens.
 
 ---
 

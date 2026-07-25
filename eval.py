@@ -2,69 +2,16 @@ import argparse
 from typing import Tuple
 
 import torch
-import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from config import TrainingConfig
+from dataset import format_instruct_example
 from mtp_model import MTPModule
-from train import normalize_nanbeige_rope_scaling, resolve_model_dtype
-
-
-@torch.no_grad()
-def chunked_top1(
-    features: torch.Tensor,
-    lm_head_weight: torch.Tensor,
-    vocab_chunk_size: int,
-) -> torch.Tensor:
-    """Return exact LM-head top-1 IDs without allocating full-vocabulary logits."""
-    if vocab_chunk_size <= 0:
-        raise ValueError("kd_vocab_chunk_size must be positive")
-
-    original_shape = features.shape[:-1]
-    flat_features = features.reshape(-1, features.size(-1)).to(lm_head_weight.dtype)
-    best_values = torch.full(
-        (flat_features.size(0),),
-        -torch.inf,
-        device=features.device,
-        dtype=torch.float32,
-    )
-    best_ids = torch.zeros(
-        flat_features.size(0),
-        device=features.device,
-        dtype=torch.long,
-    )
-
-    for start in range(0, lm_head_weight.size(0), vocab_chunk_size):
-        end = min(start + vocab_chunk_size, lm_head_weight.size(0))
-        logits = F.linear(flat_features, lm_head_weight[start:end]).float()
-        chunk_values, chunk_ids = logits.max(dim=-1)
-        replace = chunk_values > best_values
-        best_values = torch.maximum(best_values, chunk_values)
-        best_ids[replace] = chunk_ids[replace] + start
-
-    return best_ids.reshape(original_shape)
-
-
-def build_evaluation_text(tokenizer, assistant_text: str) -> str:
-    """Use the same user/assistant conversation shape as Alpaca training rows."""
-    messages = [
-        {
-            "role": "user",
-            "content": "Write a short overview of the history of artificial intelligence.",
-        },
-        {"role": "assistant", "content": assistant_text},
-    ]
-    try:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-    except Exception:
-        return (
-            f"User: {messages[0]['content']}\n\n"
-            f"Assistant: {messages[1]['content']}"
-        )
+from train import (
+    chunked_top1,
+    normalize_nanbeige_rope_scaling,
+    resolve_model_dtype,
+)
 
 
 def load_base_model(
@@ -135,14 +82,22 @@ def evaluate_acceptance_rate(
     mtp_module.load_state_dict(state_dict)
     mtp_module.eval()
 
-    formatted_text = build_evaluation_text(tokenizer, text_sample)
+    example = format_instruct_example(
+        "Write a short overview of the history of artificial intelligence.",
+        "",
+        text_sample,
+        tokenizer,
+    )
     inputs = tokenizer(
-        formatted_text,
+        example["text"],
         return_tensors="pt",
         add_special_tokens=False,
     ).to(device)
     input_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
+    positions = torch.arange(input_ids.size(1), device=device).unsqueeze(0)
+    assistant_mask = positions >= example["assistant_start"]
+    assistant_mask &= attention_mask.bool()
     if input_ids.size(1) < 4:
         raise ValueError("Evaluation sample must contain at least four tokens")
 
@@ -163,6 +118,7 @@ def evaluate_acceptance_rate(
     emb_next = base_model.get_input_embeddings()(input_ids[:, 1:-1])
     mtp_attention_mask = attention_mask[:, :-2]
     valid_mask = attention_mask[:, 2:].bool()
+    valid_mask &= assistant_mask[:, 2:]
 
     mtp_features = mtp_module(
         h_t.float(),

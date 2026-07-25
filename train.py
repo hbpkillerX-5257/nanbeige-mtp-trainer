@@ -73,10 +73,18 @@ def resolve_model_dtype(config: TrainingConfig, device: torch.device) -> torch.d
     precision = config.mixed_precision.lower()
     if precision == "bf16":
         if not torch.cuda.is_bf16_supported():
-            raise RuntimeError("mixed_precision='bf16' was requested, but this GPU lacks BF16 support")
+            raise RuntimeError(
+                "Nanbeige4.2 requires BF16, but this GPU does not support it. "
+                "NVIDIA T4/P100 GPUs are not suitable; use an A100, L4, A10, "
+                "RTX 30/40-series, or newer BF16-capable GPU."
+            )
         return torch.bfloat16
     if precision == "fp16":
-        return torch.float16
+        raise RuntimeError(
+            "FP16 is disabled for Nanbeige4.2 because it collapses the teacher "
+            "predictions. Use mixed_precision='bf16' on supported hardware, or "
+            "'fp32' if sufficient memory is available."
+        )
     if precision == "fp32":
         return torch.float32
     raise ValueError("mixed_precision must be one of: fp16, bf16, fp32")
@@ -109,6 +117,114 @@ def normalize_nanbeige_rope_scaling(model_config) -> None:
     normalized = dict(rope_scaling)
     normalized["type"] = scaling_type
     model_config.rope_scaling = normalized
+
+
+@torch.no_grad()
+def chunked_top1(
+    features: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    vocab_chunk_size: int,
+) -> torch.Tensor:
+    """Return exact LM-head top-1 IDs without allocating full-vocabulary logits."""
+    if vocab_chunk_size <= 0:
+        raise ValueError("kd_vocab_chunk_size must be positive")
+
+    original_shape = features.shape[:-1]
+    flat_features = features.reshape(-1, features.size(-1)).to(lm_head_weight.dtype)
+    best_values = torch.full(
+        (flat_features.size(0),),
+        -torch.inf,
+        device=features.device,
+        dtype=torch.float32,
+    )
+    best_ids = torch.zeros(
+        flat_features.size(0),
+        device=features.device,
+        dtype=torch.long,
+    )
+
+    for start in range(0, lm_head_weight.size(0), vocab_chunk_size):
+        end = min(start + vocab_chunk_size, lm_head_weight.size(0))
+        logits = F.linear(flat_features, lm_head_weight[start:end]).float()
+        if not torch.isfinite(logits).all():
+            raise RuntimeError("Base model produced non-finite LM-head logits")
+        chunk_values, chunk_ids = logits.max(dim=-1)
+        replace = chunk_values > best_values
+        best_values = torch.maximum(best_values, chunk_values)
+        best_ids[replace] = chunk_ids[replace] + start
+
+    return best_ids.reshape(original_shape)
+
+
+@torch.no_grad()
+def validate_teacher_health(
+    base_model,
+    tokenizer,
+    device: torch.device,
+    vocab_chunk_size: int,
+) -> Tuple[float, int, int]:
+    """Fail before training if the frozen teacher has collapsed predictions."""
+    messages = [
+        {
+            "role": "user",
+            "content": "Briefly explain what artificial intelligence is.",
+        },
+        {
+            "role": "assistant",
+            "content": (
+                "Artificial intelligence is the study of computer systems that "
+                "perform tasks involving reasoning, learning, and decision making."
+            ),
+        },
+    ]
+    try:
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            enable_thinking=False,
+        )
+    except Exception:
+        text = (
+            f"User: {messages[0]['content']}\n\n"
+            f"Assistant: {messages[1]['content']}"
+        )
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+        add_special_tokens=False,
+    ).to(device)
+    outputs = base_model.model(
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        output_hidden_states=False,
+        use_cache=False,
+        return_dict=True,
+    )
+    hidden = outputs.last_hidden_state
+    if not torch.isfinite(hidden).all():
+        raise RuntimeError("Base teacher produced non-finite hidden states")
+
+    predictions = chunked_top1(
+        hidden[:, :-1, :],
+        base_model.get_output_embeddings().weight,
+        vocab_chunk_size,
+    )
+    targets = inputs["input_ids"][:, 1:]
+    total = int(targets.numel())
+    matches = int((predictions == targets).sum().item())
+    accuracy = matches / max(total, 1)
+    unique_predictions = int(predictions.unique().numel())
+
+    if matches == 0 or unique_predictions < 4:
+        raise RuntimeError(
+            "Base teacher health check failed: "
+            f"next-token accuracy={accuracy:.2%}, "
+            f"unique_predictions={unique_predictions}/{total}. "
+            "The teacher has collapsed, so MTP training would be invalid. "
+            "Nanbeige4.2 requires BF16 (or FP32); do not train it in FP16."
+        )
+    return accuracy, unique_predictions, total
 
 
 @torch.no_grad()
@@ -317,6 +433,19 @@ def train(resume: bool = False) -> None:
             parameter.requires_grad = False
         base_model.eval()
 
+        teacher_accuracy, teacher_unique, teacher_tokens = validate_teacher_health(
+            base_model,
+            tokenizer,
+            device,
+            config.kd_vocab_chunk_size,
+        )
+        if is_main_process:
+            print(
+                "Teacher health check passed: "
+                f"next-token accuracy={teacher_accuracy:.2%}, "
+                f"unique_predictions={teacher_unique}/{teacher_tokens}"
+            )
+
         mtp_module = MTPModule(
             hidden_size=base_model.config.hidden_size,
             base_layer=base_model.model.layers[-1],
@@ -396,9 +525,10 @@ def train(resume: bool = False) -> None:
             for step, batch in enumerate(pbar):
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
                 attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+                assistant_mask = batch["assistant_mask"].to(device, non_blocking=True)
 
                 locally_usable = input_ids.shape[1] >= 4 and bool(
-                    attention_mask[:, 2:].any().item()
+                    assistant_mask[:, 2:].any().item()
                 )
                 if not all_ranks_true(locally_usable, device):
                     continue
@@ -416,7 +546,11 @@ def train(resume: bool = False) -> None:
                     teacher_features = final_hidden[:, 1:-1, :]
                     emb_next = base_model.get_input_embeddings()(input_ids[:, 1:-1])
                     mtp_attention_mask = attention_mask[:, :-2]
+                    # For instruction datasets, distill only teacher
+                    # probabilities whose target token is in the assistant
+                    # answer. Plain-text datasets mark every token as valid.
                     valid_mask = attention_mask[:, 2:].bool()
+                    valid_mask &= assistant_mask[:, 2:]
 
                 mtp_features = mtp_module(
                     h_t.float(),

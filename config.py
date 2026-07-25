@@ -25,7 +25,8 @@ class TrainingConfig:
     weight_decay: float = 0.01
     warmup_steps: int = 100
     epochs: int = 1
-    mixed_precision: str = "fp16"  # "fp16", "bf16", or "fp32"
+    # Nanbeige4.2 is a BF16 model. FP16 collapses on T4-class hardware.
+    mixed_precision: str = "bf16"  # "bf16" or "fp32" recommended
     kd_vocab_chunk_size: int = 8192
     
     # Saving & Output
