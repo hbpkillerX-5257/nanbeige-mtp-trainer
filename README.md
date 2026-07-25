@@ -8,6 +8,17 @@ A lightweight PyTorch repository for training a **Multi-Token Prediction (MTP)**
 > before loading the model when BF16 is unavailable and also runs a teacher
 > health check before the first training batch.
 
+Install the model's pinned Transformers version before launching:
+
+```bash
+pip install --upgrade "transformers==4.42.4"
+```
+
+Transformers 5.x can load the checkpoint without an immediate exception but
+produces collapsed Nanbeige teacher predictions. The trainer checks the version
+before initializing DDP or downloading model weights. The Hugging Face model
+revision is also pinned in `config.py` for reproducibility.
+
 ---
 
 ## 📁 Repository Structure

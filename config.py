@@ -6,6 +6,7 @@ from typing import Optional
 class TrainingConfig:
     # Model Configuration
     base_model_name: str = "Nanbeige/Nanbeige4.2-3B"
+    model_revision: str = "a8a131e1689a819fb9119f16bf8a2629d09fd41c"
     
     # Dataset Configuration (Default to Alpaca for Instruction/QnA models)
     dataset_name: str = "tatsu-lab/alpaca"

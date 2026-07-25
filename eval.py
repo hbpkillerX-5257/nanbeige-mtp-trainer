@@ -10,6 +10,7 @@ from mtp_model import MTPModule
 from train import (
     chunked_top1,
     normalize_nanbeige_rope_scaling,
+    require_compatible_transformers,
     resolve_model_dtype,
 )
 
@@ -22,6 +23,7 @@ def load_base_model(
     """Load tokenizer and teacher with the same compatibility settings as training."""
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
+        revision=training_config.model_revision,
         trust_remote_code=True,
         use_fast=False,
     )
@@ -34,13 +36,18 @@ def load_base_model(
             raise ValueError("Tokenizer has no existing token that can be used for padding")
     tokenizer.padding_side = "right"
 
-    model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    model_config = AutoConfig.from_pretrained(
+        model_name,
+        revision=training_config.model_revision,
+        trust_remote_code=True,
+    )
     normalize_nanbeige_rope_scaling(model_config)
     dtype = resolve_model_dtype(training_config, device)
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         config=model_config,
+        revision=training_config.model_revision,
         torch_dtype=dtype,
         trust_remote_code=True,
         device_map={"": device},
@@ -61,6 +68,7 @@ def evaluate_acceptance_rate(
     ),
     device_name: str = "cuda:0",
 ) -> None:
+    require_compatible_transformers()
     training_config = TrainingConfig()
     device = torch.device(device_name if torch.cuda.is_available() else "cpu")
 

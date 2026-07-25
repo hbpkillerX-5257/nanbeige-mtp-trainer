@@ -35,6 +35,19 @@ from dataset import get_dataloader
 from mtp_model import MTPModule
 
 
+REQUIRED_TRANSFORMERS_VERSION = "4.42.4"
+
+
+def require_compatible_transformers() -> None:
+    if transformers.__version__ != REQUIRED_TRANSFORMERS_VERSION:
+        raise RuntimeError(
+            f"Nanbeige4.2 requires transformers=={REQUIRED_TRANSFORMERS_VERSION}, "
+            f"but {transformers.__version__} is installed. Install the pinned "
+            "version with: pip install --upgrade "
+            f"'transformers=={REQUIRED_TRANSFORMERS_VERSION}'"
+        )
+
+
 def init_distributed() -> Tuple[int, int, int]:
     """Initialize DDP for torchrun, or return a single-process configuration."""
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
@@ -388,6 +401,7 @@ def save_trainer_state(
 
 
 def train(resume: bool = False) -> None:
+    require_compatible_transformers()
     config = TrainingConfig()
     config.resume_from_checkpoint = resume
     rank, local_rank, world_size = init_distributed()
@@ -407,6 +421,7 @@ def train(resume: bool = False) -> None:
 
         tokenizer = AutoTokenizer.from_pretrained(
             config.base_model_name,
+            revision=config.model_revision,
             trust_remote_code=True,
             use_fast=False,
         )
@@ -419,11 +434,16 @@ def train(resume: bool = False) -> None:
                 raise ValueError("Tokenizer has no existing token that can be used for padding")
         tokenizer.padding_side = "right"
 
-        model_config = AutoConfig.from_pretrained(config.base_model_name, trust_remote_code=True)
+        model_config = AutoConfig.from_pretrained(
+            config.base_model_name,
+            revision=config.model_revision,
+            trust_remote_code=True,
+        )
         normalize_nanbeige_rope_scaling(model_config)
         base_model = AutoModelForCausalLM.from_pretrained(
             config.base_model_name,
             config=model_config,
+            revision=config.model_revision,
             torch_dtype=dtype,
             trust_remote_code=True,
             device_map={"": device},
