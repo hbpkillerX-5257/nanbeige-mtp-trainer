@@ -82,6 +82,35 @@ def resolve_model_dtype(config: TrainingConfig, device: torch.device) -> torch.d
     raise ValueError("mixed_precision must be one of: fp16, bf16, fp32")
 
 
+def normalize_nanbeige_rope_scaling(model_config) -> None:
+    """
+    Translate current Transformers RoPE metadata to Nanbeige's legacy format.
+
+    Recent Transformers versions may turn the model's default RoPE settings
+    into {"rope_type": "default", ...}. Nanbeige treats any non-None value as
+    scaled RoPE and expects the legacy {"type", "factor"} keys.
+    """
+    rope_scaling = getattr(model_config, "rope_scaling", None)
+    if not isinstance(rope_scaling, dict):
+        return
+
+    scaling_type = rope_scaling.get("type", rope_scaling.get("rope_type"))
+    if scaling_type in (None, "default"):
+        model_config.rope_scaling = None
+        return
+
+    if scaling_type not in {"linear", "dynamic"}:
+        raise ValueError(
+            f"Nanbeige remote code does not support rope scaling type {scaling_type!r}"
+        )
+    if "factor" not in rope_scaling:
+        raise ValueError(f"RoPE scaling type {scaling_type!r} requires a factor")
+
+    normalized = dict(rope_scaling)
+    normalized["type"] = scaling_type
+    model_config.rope_scaling = normalized
+
+
 @torch.no_grad()
 def exact_chunked_kd(
     student_features: torch.Tensor,
@@ -271,6 +300,7 @@ def train(resume: bool = False) -> None:
         tokenizer.padding_side = "right"
 
         model_config = AutoConfig.from_pretrained(config.base_model_name, trust_remote_code=True)
+        normalize_nanbeige_rope_scaling(model_config)
         # Use the eager implementation because the MTP block supplies an explicit
         # four-dimensional additive mask and FlashAttention is intentionally off.
         model_config._attn_implementation = "eager"
