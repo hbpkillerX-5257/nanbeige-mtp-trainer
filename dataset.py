@@ -1,13 +1,13 @@
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from datasets import load_dataset
 
 
-def get_dataloader(config, tokenizer, local_rank=0, world_size=1):
+def get_dataloader(config, tokenizer, rank=0, world_size=1):
     """
     Load dataset and return DataLoader configured for multi-GPU training.
     """
-    print(f"[Rank {local_rank}] Loading dataset: {config.dataset_name} ({config.dataset_config})...")
+    print(f"[Rank {rank}] Loading dataset: {config.dataset_name} ({config.dataset_config})...")
     
     try:
         if config.dataset_config:
@@ -52,14 +52,17 @@ def get_dataloader(config, tokenizer, local_rank=0, world_size=1):
             return_tensors="pt",
             add_special_tokens=False
         )
-        return encodings["input_ids"]
+        return {
+            "input_ids": encodings["input_ids"],
+            "attention_mask": encodings["attention_mask"],
+        }
 
     # In DDP / torchrun, use DistributedSampler
     if world_size > 1:
         sampler = torch.utils.data.distributed.DistributedSampler(
             texts,
             num_replicas=world_size,
-            rank=local_rank,
+            rank=rank,
             shuffle=True
         )
         loader = DataLoader(

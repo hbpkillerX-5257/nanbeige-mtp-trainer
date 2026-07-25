@@ -1,14 +1,13 @@
 import copy
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class MTPModule(nn.Module):
     """
     Multi-Token Prediction Layer for Nanbeige 4.2.
-    Takes base model hidden state h_t and token embedding e(y_t),
-    and refines representations for predicting token y_{t+1}.
+    Takes base-model hidden state h_t and token embedding e(y_{t+1}),
+    then produces a representation for predicting token y_{t+2}.
     """
     def __init__(self, hidden_size: int, base_layer: nn.Module = None):
         super().__init__()
@@ -25,7 +24,13 @@ class MTPModule(nn.Module):
         nn.init.normal_(self.eh_proj.weight, mean=0.0, std=0.02)
         # We DO NOT re-initialize transformer_block because we want the pre-trained weights!
 
-    def forward(self, h_t: torch.Tensor, emb_next: torch.Tensor, position_ids=None) -> torch.Tensor:
+    def forward(
+        self,
+        h_t: torch.Tensor,
+        emb_next: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        position_ids: torch.Tensor = None,
+    ) -> torch.Tensor:
         # Concatenate hidden state and embedding along feature dimension
         x = torch.cat([h_t, emb_next], dim=-1)
         x = self.eh_proj(x)
@@ -37,8 +42,21 @@ class MTPModule(nn.Module):
         
         # Build standard HF causal attention mask [B, 1, S, S]
         causal_mask = torch.triu(torch.ones(S, S, device=x.device, dtype=torch.bool), diagonal=1)
-        attention_mask = torch.zeros(B, 1, S, S, device=x.device, dtype=x.dtype)
-        attention_mask.masked_fill_(causal_mask, torch.finfo(x.dtype).min)
+        combined_mask = torch.zeros(B, 1, S, S, device=x.device, dtype=x.dtype)
+        combined_mask.masked_fill_(causal_mask, torch.finfo(x.dtype).min)
+
+        # Mask padding keys as well as future keys. Queries at padded positions are
+        # harmless because the trainer excludes them from the loss.
+        if attention_mask is not None:
+            if attention_mask.shape != (B, S):
+                raise ValueError(
+                    f"Expected attention_mask shape {(B, S)}, got {tuple(attention_mask.shape)}"
+                )
+            padding_keys = ~attention_mask.to(device=x.device, dtype=torch.bool)
+            combined_mask.masked_fill_(
+                padding_keys[:, None, None, :],
+                torch.finfo(x.dtype).min,
+            )
         
         if position_ids is None:
             position_ids = torch.arange(S, device=x.device, dtype=torch.long).unsqueeze(0).expand(B, -1)
@@ -47,7 +65,7 @@ class MTPModule(nn.Module):
         # Nanbeige base layer returns a tuple: (hidden_states, ...)
         outputs = self.transformer_block(
             hidden_states=x, 
-            attention_mask=attention_mask,
+            attention_mask=combined_mask,
             position_ids=position_ids,
             use_cache=False
         )

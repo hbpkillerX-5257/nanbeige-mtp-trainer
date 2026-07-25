@@ -41,6 +41,22 @@ Or directly via `torchrun`:
 !torchrun --nproc_per_node=2 nanbeige_mtp_trainer/train.py
 ```
 
+To resume from the epoch checkpoint (including optimizer and scheduler state):
+
+```bash
+!torchrun --nproc_per_node=2 nanbeige_mtp_trainer/train.py --resume
+```
+
+Training does not resume unless `--resume` is supplied. The resumable state is
+stored as `mtp_output/trainer_state.pt`; the standalone MTP weights remain in
+`nanbeige_mtp_head.pt`.
+
+The KL-distillation calculation streams over vocabulary chunks. LM-head
+projections use the model dtype, while normalization, KL accumulation, and
+gradient accumulation use FP32. This keeps the exact teacher distribution while
+avoiding full `[tokens, vocabulary]` probability tensors.
+`kd_vocab_chunk_size` in `config.py` controls the memory/throughput tradeoff.
+
 ---
 
 ## 📦 Model Saving & Output Formats
@@ -50,6 +66,9 @@ The training script automatically saves the model in three formats under `./mtp_
 1. **`nanbeige_mtp_head.pt`**: Standard PyTorch state dict.
 2. **`nanbeige_mtp_head.safetensors`**: HuggingFace Safetensors format.
 3. **`nanbeige_mtp_gguf_tensors.pt`**: llama.cpp-formatted tensor dictionary with `mtp.0.*` and `nextn.eh_proj` keys.
+
+The trainer also writes **`trainer_state.pt`** after each completed epoch for
+reliable `--resume` operation.
 
 ---
 

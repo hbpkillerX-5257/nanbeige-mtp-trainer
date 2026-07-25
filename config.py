@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -14,13 +14,9 @@ class TrainingConfig:
     max_samples: int = 52000  # Full Alpaca dataset
     
     # Checkpointing
-    resume_from_checkpoint: bool = True
+    resume_from_checkpoint: bool = False
     checkpoint_dir: str = "./mtp_output"
-    
-    # MTP Architecture Parameters
-    num_mtp_layers: int = 1
-    num_heads: int = 8
-    ffn_dim: int = 10752
+    trainer_state_name: str = "trainer_state.pt"
     
     # Training Hyperparameters
     batch_size_per_gpu: int = 1
@@ -29,7 +25,8 @@ class TrainingConfig:
     weight_decay: float = 0.01
     warmup_steps: int = 100
     epochs: int = 1
-    mixed_precision: str = "fp16"  # "fp16" or "bf16"
+    mixed_precision: str = "fp16"  # "fp16", "bf16", or "fp32"
+    kd_vocab_chunk_size: int = 8192
     
     # Saving & Output
     output_dir: str = "./mtp_output"

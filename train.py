@@ -1,305 +1,505 @@
+import argparse
+import math
 import os
 import sys
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 # Add package directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-# 1. UNINSTALL BROKEN FLASH_ATTN FROM PYTHON MEMORY
-for mod_name in list(sys.modules.keys()):
-    if mod_name.startswith("flash_attn"):
-        del sys.modules[mod_name]
-sys.modules["flash_attn"] = None
-
-# 2. DISABLE TRANSFORMERS CHECKS
+# Nanbeige's remote module imports this symbol from transformers.utils. Patch
+# both namespaces before loading the remote module so a broken flash-attn
+# installation cannot be selected accidentally.
+import transformers.utils
 import transformers.utils.import_utils
+
 transformers.utils.import_utils.is_flash_attn_2_available = lambda: False
-import transformers.dynamic_module_utils
-transformers.dynamic_module_utils.check_imports = lambda filename: []
+transformers.utils.is_flash_attn_2_available = lambda: False
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
-from tqdm import tqdm
+import torch.nn.functional as F
 from safetensors.torch import save_file
+from torch.nn.parallel import DistributedDataParallel as DDP
+from tqdm import tqdm
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    get_cosine_schedule_with_warmup,
+)
 
 from config import TrainingConfig
-from mtp_model import MTPModule
 from dataset import get_dataloader
+from mtp_model import MTPModule
 
 
-# Monkey-patch DynamicCache.from_legacy_cache and to_legacy_cache for newer transformers compatibility
-import transformers.cache_utils
-if not hasattr(transformers.cache_utils.DynamicCache, "from_legacy_cache"):
-    @classmethod
-    def from_legacy_cache(cls, past_key_values=None):
-        if past_key_values is None:
-            return cls()
-        if isinstance(past_key_values, cls):
-            return past_key_values
-        cache = cls()
-        if past_key_values is not None:
-            for layer_idx, (key_states, value_states) in enumerate(past_key_values):
-                cache.update(key_states, value_states, layer_idx)
-        return cache
-    transformers.cache_utils.DynamicCache.from_legacy_cache = from_legacy_cache
-
-if not hasattr(transformers.cache_utils.DynamicCache, "to_legacy_cache"):
-    def to_legacy_cache(self):
-        legacy_cache = ()
-        keys = getattr(self, "key_cache", getattr(self, "_key_cache", []))
-        values = getattr(self, "value_cache", getattr(self, "_value_cache", []))
-        for layer_idx in range(len(keys)):
-            legacy_cache += ((keys[layer_idx], values[layer_idx]),)
-        return legacy_cache
-    transformers.cache_utils.DynamicCache.to_legacy_cache = to_legacy_cache
-
-
-def init_distributed():
-    """
-    Initialize Distributed Data Parallel (DDP) for torchrun / multi-GPU training.
-    """
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
-        return rank, local_rank, world_size
-    else:
+def init_distributed() -> Tuple[int, int, int]:
+    """Initialize DDP for torchrun, or return a single-process configuration."""
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         return 0, 0, 1
 
+    if not torch.cuda.is_available():
+        raise RuntimeError("torchrun/DDP training requires CUDA for the NCCL backend")
 
-def cleanup_distributed():
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    return rank, local_rank, world_size
+
+
+def cleanup_distributed() -> None:
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
-def train(resume: bool = False):
-    config = TrainingConfig()
-    
-    # Override config with command line args if specified
-    if resume:
-        config.resume_from_checkpoint = True
-    rank, local_rank, world_size = init_distributed()
-    is_main_process = (rank == 0)
+def all_ranks_true(local_value: bool, device: torch.device) -> bool:
+    """Return True only when every DDP rank reports True."""
+    if not dist.is_initialized():
+        return local_value
 
-    if is_main_process:
-        print(f"=== Starting Distributed MTP Training (World Size: {world_size}) ===")
-        os.makedirs(config.output_dir, exist_ok=True)
+    flag = torch.tensor(int(local_value), device=device, dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
 
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-    # 1. Load Tokenizer & Base Model
-    if is_main_process:
-        print(f"Loading Base Model: {config.base_model_name}...")
+def resolve_model_dtype(config: TrainingConfig, device: torch.device) -> torch.dtype:
+    if device.type != "cuda":
+        return torch.float32
 
-    tokenizer = AutoTokenizer.from_pretrained(config.base_model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    precision = config.mixed_precision.lower()
+    if precision == "bf16":
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError("mixed_precision='bf16' was requested, but this GPU lacks BF16 support")
+        return torch.bfloat16
+    if precision == "fp16":
+        return torch.float16
+    if precision == "fp32":
+        return torch.float32
+    raise ValueError("mixed_precision must be one of: fp16, bf16, fp32")
 
-    # Load Config and patch rope_scaling for newer transformers compatibility
-    from transformers import AutoConfig
-    model_config = AutoConfig.from_pretrained(config.base_model_name, trust_remote_code=True)
-    if hasattr(model_config, "rope_scaling") and model_config.rope_scaling:
-        if isinstance(model_config.rope_scaling, dict):
-            model_config.rope_scaling["type"] = "linear"
-            model_config.rope_scaling["factor"] = 1.0
 
-    # Load base model on current GPU rank
-    base_model = AutoModelForCausalLM.from_pretrained(
-        config.base_model_name,
-        config=model_config,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-        device_map={"": device}
+@torch.no_grad()
+def exact_chunked_kd(
+    student_features: torch.Tensor,
+    teacher_features: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    valid_mask: torch.Tensor,
+    vocab_chunk_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    """
+    Compute exact mean KL(teacher || student) without materializing [N, vocab].
+
+    The LM head is frozen, so the derivative with respect to student features is
+    W^T (p_student - p_teacher). Computing that derivative explicitly lets us
+    stream over vocabulary chunks and then backpropagate once through the
+    trainable MTP block. Projections use the frozen head's model dtype (matching
+    normal inference); normalization, KL accumulation, and gradient accumulation
+    use FP32.
+    """
+    if vocab_chunk_size <= 0:
+        raise ValueError("kd_vocab_chunk_size must be positive")
+
+    flat_mask = valid_mask.reshape(-1)
+    num_valid = int(flat_mask.sum().item())
+    if num_valid == 0:
+        empty_grad = torch.zeros_like(student_features, dtype=torch.float32)
+        return student_features.new_zeros((), dtype=torch.float32), empty_grad, 0, 0
+
+    projection_dtype = lm_head_weight.dtype
+    student_valid = (
+        student_features.detach()
+        .reshape(-1, student_features.size(-1))[flat_mask]
+        .to(projection_dtype)
+    )
+    teacher_valid = (
+        teacher_features.detach()
+        .reshape(-1, teacher_features.size(-1))[flat_mask]
+        .to(projection_dtype)
+    )
+    vocab_size = lm_head_weight.size(0)
+    device = student_features.device
+
+    student_log_z = torch.full((num_valid,), -torch.inf, device=device, dtype=torch.float32)
+    teacher_log_z = torch.full_like(student_log_z, -torch.inf)
+    student_max = torch.full_like(student_log_z, -torch.inf)
+    teacher_max = torch.full_like(student_log_z, -torch.inf)
+    student_argmax = torch.zeros(num_valid, device=device, dtype=torch.long)
+    teacher_argmax = torch.zeros_like(student_argmax)
+
+    # First pass: exact normalizers and top-1 predictions.
+    for start in range(0, vocab_size, vocab_chunk_size):
+        end = min(start + vocab_chunk_size, vocab_size)
+        weight = lm_head_weight[start:end].detach()
+        student_logits = F.linear(student_valid, weight).float()
+        teacher_logits = F.linear(teacher_valid, weight).float()
+
+        student_log_z = torch.logaddexp(student_log_z, torch.logsumexp(student_logits, dim=-1))
+        teacher_log_z = torch.logaddexp(teacher_log_z, torch.logsumexp(teacher_logits, dim=-1))
+
+        chunk_student_max, chunk_student_idx = student_logits.max(dim=-1)
+        chunk_teacher_max, chunk_teacher_idx = teacher_logits.max(dim=-1)
+        replace_student = chunk_student_max > student_max
+        replace_teacher = chunk_teacher_max > teacher_max
+        student_max = torch.maximum(student_max, chunk_student_max)
+        teacher_max = torch.maximum(teacher_max, chunk_teacher_max)
+        student_argmax[replace_student] = chunk_student_idx[replace_student] + start
+        teacher_argmax[replace_teacher] = chunk_teacher_idx[replace_teacher] + start
+
+        del weight, student_logits, teacher_logits
+
+    # Second pass: KL value and its exact gradient with respect to MTP features.
+    loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+    grad_valid = torch.zeros(
+        student_valid.shape,
+        device=device,
+        dtype=torch.float32,
+    )
+    # Scaling before the frozen FP16/BF16 projection protects small probability
+    # differences from underflow; the result is unscaled in FP32.
+    projection_scale = 1024.0 if projection_dtype != torch.float32 else 1.0
+    for start in range(0, vocab_size, vocab_chunk_size):
+        end = min(start + vocab_chunk_size, vocab_size)
+        weight = lm_head_weight[start:end].detach()
+        student_logits = F.linear(student_valid, weight).float()
+        teacher_logits = F.linear(teacher_valid, weight).float()
+        student_log_probs = student_logits - student_log_z[:, None]
+        teacher_log_probs = teacher_logits - teacher_log_z[:, None]
+        teacher_probs = teacher_log_probs.exp()
+        student_probs = student_log_probs.exp()
+
+        loss_sum += (teacher_probs * (teacher_log_probs - student_log_probs)).sum()
+        probability_delta = (student_probs - teacher_probs) * projection_scale
+        grad_chunk = F.linear(
+            probability_delta.to(projection_dtype),
+            weight.t(),
+        ).float()
+        grad_valid.add_(grad_chunk / projection_scale)
+
+        del (
+            weight,
+            student_logits,
+            teacher_logits,
+            student_log_probs,
+            teacher_log_probs,
+            teacher_probs,
+            student_probs,
+            probability_delta,
+            grad_chunk,
+        )
+
+    loss = loss_sum / num_valid
+    grad_valid.div_(num_valid)
+    grad_features = torch.zeros_like(student_features, dtype=torch.float32)
+    grad_features.reshape(-1, grad_features.size(-1))[flat_mask] = grad_valid
+    correct = int((student_argmax == teacher_argmax).sum().item())
+    return loss, grad_features, correct, num_valid
+
+
+def optimizer_step(
+    mtp_module: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    accumulated_batches: int,
+) -> None:
+    """Average accumulated batch gradients, clip, and update once."""
+    if accumulated_batches <= 0:
+        return
+    for parameter in mtp_module.parameters():
+        if parameter.grad is not None:
+            parameter.grad.div_(accumulated_batches)
+    torch.nn.utils.clip_grad_norm_(mtp_module.parameters(), max_norm=1.0)
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad(set_to_none=True)
+
+
+def save_trainer_state(
+    path: str,
+    raw_mtp: MTPModule,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    next_epoch: int,
+    global_step: int,
+) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(
+        {
+            "model": raw_mtp.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "next_epoch": next_epoch,
+            "global_step": global_step,
+        },
+        path,
     )
 
-    # Freeze Base Model parameters completely
-    for p in base_model.parameters():
-        p.requires_grad = False
-    base_model.eval()
 
-    hidden_size = base_model.config.hidden_size
-    vocab_size = base_model.config.vocab_size
+def train(resume: bool = False) -> None:
+    config = TrainingConfig()
+    config.resume_from_checkpoint = resume
+    rank, local_rank, world_size = init_distributed()
+    is_main_process = rank == 0
 
-    # 2. Instantiate MTP Module
-    # Initialize MTP module by explicitly cloning the base model's last layer
-    mtp_module = MTPModule(
-        hidden_size=hidden_size,
-        base_layer=base_model.model.layers[-1]
-    ).to(device=device, dtype=torch.float32)  # Force MTP head to FP32 to completely avoid NaN overflows
-    
-    # 2.5 Resume from Checkpoint if requested
-    checkpoint_path = os.path.join(config.checkpoint_dir, "nanbeige_mtp_head.pt")
-    if config.resume_from_checkpoint and os.path.exists(checkpoint_path):
+    try:
         if is_main_process:
-            print(f"=== Resuming training from checkpoint: {checkpoint_path} ===")
-        
-        # Load weights (map_location ensures they load onto the correct GPU for DDP)
-        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
-        mtp_module.load_state_dict(state_dict)
+            print(f"=== Starting Distributed MTP Training (World Size: {world_size}) ===")
+            os.makedirs(config.output_dir, exist_ok=True)
+            os.makedirs(config.checkpoint_dir, exist_ok=True)
+
+        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+        dtype = resolve_model_dtype(config, device)
+
         if is_main_process:
-            print("=== Successfully loaded checkpoint weights! ===")
+            print(f"Loading Base Model: {config.base_model_name} ({dtype})...")
 
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.base_model_name,
+            trust_remote_code=True,
+            use_fast=False,
+        )
+        if tokenizer.pad_token is None:
+            if tokenizer.unk_token is not None:
+                tokenizer.pad_token = tokenizer.unk_token
+            elif tokenizer.eos_token is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+            else:
+                raise ValueError("Tokenizer has no existing token that can be used for padding")
+        tokenizer.padding_side = "right"
 
-    # Wrap MTP module in PyTorch DDP for multi-GPU synchronization
-    if world_size > 1:
-        mtp_module = DDP(mtp_module, device_ids=[local_rank], output_device=local_rank)
+        model_config = AutoConfig.from_pretrained(config.base_model_name, trust_remote_code=True)
+        # Use the eager implementation because the MTP block supplies an explicit
+        # four-dimensional additive mask and FlashAttention is intentionally off.
+        model_config._attn_implementation = "eager"
 
-    # 3. Setup Optimizer
-    optimizer = torch.optim.AdamW(mtp_module.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+        base_model = AutoModelForCausalLM.from_pretrained(
+            config.base_model_name,
+            config=model_config,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            attn_implementation="eager",
+            device_map={"": device},
+        )
+        for parameter in base_model.parameters():
+            parameter.requires_grad = False
+        base_model.eval()
 
-    # 4. Setup DataLoader
-    dataloader = get_dataloader(config, tokenizer, local_rank=local_rank, world_size=world_size)
-    
-    total_steps = (len(dataloader) // config.gradient_accumulation_steps) * config.epochs
-    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=config.warmup_steps, num_training_steps=total_steps)
+        mtp_module = MTPModule(
+            hidden_size=base_model.config.hidden_size,
+            base_layer=base_model.model.layers[-1],
+        ).to(device=device, dtype=torch.float32)
 
-    # 5. Training Loop
-    if is_main_process:
-        print(f"Training MTP Head over {config.epochs} epoch(s)...")
-
-    raw_mtp = mtp_module.module if hasattr(mtp_module, "module") else mtp_module
-    raw_mtp.train()
-    optimizer.zero_grad()
-
-    for epoch in range(config.epochs):
-        if hasattr(dataloader, "sampler") and hasattr(dataloader.sampler, "set_epoch"):
-            dataloader.sampler.set_epoch(epoch)
-
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}", disable=not is_main_process)
-        for step, input_ids in enumerate(pbar):
-            input_ids = input_ids.to(device)
-            if input_ids.shape[1] < 4:
-                continue
-
-            # Forward pass through base model (no gradients or KV cache needed)
-            with torch.no_grad():
-                outputs = base_model(input_ids, output_hidden_states=True, use_cache=False)
-                # Hidden states h_t (for step t): [B, S-2, D]
-                h_t = outputs.hidden_states[-1][:, :-2, :].clone().detach()
-                
-                # KD TARGET: Teacher's probability distribution for t+2
-                # outputs.logits[i] predicts token i+1. So index 1 predicts token 2 (t+2)
-                target_logits = outputs.logits[:, 1:-1, :].clone().detach()
-                
-                # Immediately free the base model outputs (which contains 44 layers of hidden states and logits)
-                del outputs
-                torch.cuda.empty_cache()
-                
-                # Token embeddings e(y_{t+1}) (the actual next token): [B, S-2, D]
-                embed_layer = base_model.get_input_embeddings()
-                emb_next = embed_layer(input_ids[:, 1:-1])
-                
-                # Extract ground truth targets for masking out padding
-                targets = input_ids[:, 2:]
-
-            # Forward pass through MTP module in explicit float32
-            mtp_features = mtp_module(h_t.to(torch.float32), emb_next.to(torch.float32))
-            
-            # Predict MTP logits (cast down from fp32 to base model dtype to save 2.04 GB of VRAM!)
-            lm_head = base_model.get_output_embeddings()
-            mtp_logits = F.linear(mtp_features.to(lm_head.weight.dtype), lm_head.weight)            
-            # KNOWLEDGE DISTILLATION LOSS (KL-Divergence)
-            # PyTorch KLDiv expects log-probs for predictions, and standard probs for targets.
-            mtp_log_probs = F.log_softmax(mtp_logits.to(torch.float32), dim=-1)
-            teacher_probs = F.softmax(target_logits.to(torch.float32), dim=-1)
-            
-            # CRITICAL FIX: Mask out padding tokens so we don't compute KD on garbage!
-            valid_mask = (targets != tokenizer.pad_token_id).view(-1)
-            
-            # Flatten to [N, Vocab] and filter out padding tokens
-            mtp_log_probs_flat = mtp_log_probs.view(-1, mtp_log_probs.size(-1))[valid_mask]
-            teacher_probs_flat = teacher_probs.view(-1, teacher_probs.size(-1))[valid_mask]
-            
-            kl_loss_fn = nn.KLDivLoss(reduction="batchmean")
-            loss = kl_loss_fn(mtp_log_probs_flat, teacher_probs_flat)
-            
-            # For logging: calculate how often MTP top-1 matches Teacher top-1
-            teacher_preds = torch.argmax(teacher_probs_flat, dim=-1)
-            mtp_preds = torch.argmax(mtp_log_probs_flat, dim=-1)
-            correct_tokens = (mtp_preds == teacher_preds).sum().item()
-            total_tokens = teacher_preds.numel()
-            if is_main_process and step % 50 == 0 and total_tokens > 0:
-                print(f"\n--- Step {step} Generation Sample ---")
-                valid_indices = torch.nonzero(valid_mask).squeeze()
-                if valid_indices.numel() > 0:
-                    # Pick a token from the middle of the sequence for more interesting context
-                    sample_pos = valid_indices.numel() // 2
-                    first_valid_idx = valid_indices[sample_pos].item() if valid_indices.dim() > 0 else valid_indices.item()
-                    batch_idx = first_valid_idx // (targets.size(1))
-                    seq_idx = first_valid_idx % (targets.size(1))
-                    
-                    ctx_end = seq_idx + 2 # +2 because targets is shifted by 2
-                    ctx = tokenizer.decode(input_ids[batch_idx][:ctx_end])
-                    teacher_tok = tokenizer.decode([teacher_preds[sample_pos].item()])
-                    mtp_tok = tokenizer.decode([mtp_preds[sample_pos].item()])
-                    print(f"Context: {repr(ctx)}")
-                    print(f"Teacher Predicts: {repr(teacher_tok)}")
-                    print(f"MTP Head Predicts: {repr(mtp_tok)}")
-                    print("-----------------------------------\n")
-
-            if torch.isnan(loss) or torch.isinf(loss):
-                continue
-            
-            scaled_loss = loss / config.gradient_accumulation_steps
-            scaled_loss.backward()
-            
-            # Delete massive logits tensor immediately after backward graph is populated
-            del mtp_logits
-            del mtp_features
-            del target_logits
-            del mtp_log_probs
-            del teacher_probs
-            del mtp_log_probs_flat
-            del teacher_probs_flat
-            torch.cuda.empty_cache()
-
-            if (step + 1) % config.gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(mtp_module.parameters(), max_norm=1.0)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+        trainer_state_path = os.path.join(config.checkpoint_dir, config.trainer_state_name)
+        legacy_weights_path = os.path.join(config.checkpoint_dir, config.checkpoint_name)
+        resume_state: Optional[Dict] = None
+        if config.resume_from_checkpoint:
+            if os.path.exists(trainer_state_path):
+                resume_state = torch.load(
+                    trainer_state_path,
+                    map_location=device,
+                    weights_only=True,
+                )
+                mtp_module.load_state_dict(resume_state["model"])
                 if is_main_process:
-                    pbar.set_postfix({
-                        "loss": round(loss.item(), 4),
-                        "lr": scheduler.get_last_lr()[0]
-                    })
+                    print(f"Loaded trainer checkpoint: {trainer_state_path}")
+            elif os.path.exists(legacy_weights_path):
+                mtp_module.load_state_dict(
+                    torch.load(legacy_weights_path, map_location=device, weights_only=True)
+                )
+                if is_main_process:
+                    print(
+                        f"Loaded legacy MTP weights from {legacy_weights_path}; "
+                        "optimizer and scheduler start fresh."
+                    )
+            else:
+                raise FileNotFoundError(
+                    f"--resume requested, but neither {trainer_state_path} nor "
+                    f"{legacy_weights_path} exists"
+                )
 
-    # 6. Save Model Checkpoint (Only Main Process)
-    if is_main_process:
-        print("=== Saving Trained MTP Model ===")
-        save_path = os.path.join(config.output_dir, config.checkpoint_name)
-        
-        # Save standard PyTorch weights
-        torch.save(raw_mtp.state_dict(), save_path)
-        print(f"Saved PyTorch weights to: {save_path}")
+        if world_size > 1:
+            mtp_module = DDP(mtp_module, device_ids=[local_rank], output_device=local_rank)
+        raw_mtp = mtp_module.module if isinstance(mtp_module, DDP) else mtp_module
+        mtp_module.train()
 
-        # Save llama.cpp formatted state dict
-        gguf_dict = raw_mtp.export_llama_cpp_state_dict()
-        gguf_save_path = os.path.join(config.output_dir, "nanbeige_mtp_gguf_tensors.pt")
-        torch.save(gguf_dict, gguf_save_path)
-        print(f"Saved llama.cpp formatted tensors to: {gguf_save_path}")
+        optimizer = torch.optim.AdamW(
+            mtp_module.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+        dataloader = get_dataloader(config, tokenizer, rank=rank, world_size=world_size)
+        updates_per_epoch = math.ceil(len(dataloader) / config.gradient_accumulation_steps)
+        total_steps = max(1, updates_per_epoch * config.epochs)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=config.warmup_steps,
+            num_training_steps=total_steps,
+        )
 
-        if config.save_safetensors:
-            st_path = os.path.join(config.output_dir, "nanbeige_mtp_head.safetensors")
-            save_file(gguf_dict, st_path)
-            print(f"Saved Safetensors to: {st_path}")
+        start_epoch = 0
+        global_step = 0
+        if resume_state is not None:
+            optimizer.load_state_dict(resume_state["optimizer"])
+            scheduler.load_state_dict(resume_state["scheduler"])
+            start_epoch = int(resume_state.get("next_epoch", 0))
+            global_step = int(resume_state.get("global_step", 0))
 
-    cleanup_distributed()
-    if is_main_process:
-        print("=== Training Successfully Completed ===")
+        if is_main_process:
+            print(
+                f"Training MTP head from epoch {start_epoch + 1} "
+                f"through {config.epochs}..."
+            )
+
+        optimizer.zero_grad(set_to_none=True)
+        lm_head = base_model.get_output_embeddings()
+
+        for epoch in range(start_epoch, config.epochs):
+            if hasattr(dataloader.sampler, "set_epoch"):
+                dataloader.sampler.set_epoch(epoch)
+
+            accumulated_batches = 0
+            last_loss = None
+            pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}", disable=not is_main_process)
+            for step, batch in enumerate(pbar):
+                input_ids = batch["input_ids"].to(device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+
+                locally_usable = input_ids.shape[1] >= 4 and bool(
+                    attention_mask[:, 2:].any().item()
+                )
+                if not all_ranks_true(locally_usable, device):
+                    continue
+
+                with torch.no_grad():
+                    base_outputs = base_model.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=False,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                    final_hidden = base_outputs.last_hidden_state
+                    h_t = final_hidden[:, :-2, :]
+                    teacher_features = final_hidden[:, 1:-1, :]
+                    emb_next = base_model.get_input_embeddings()(input_ids[:, 1:-1])
+                    mtp_attention_mask = attention_mask[:, :-2]
+                    valid_mask = attention_mask[:, 2:].bool()
+
+                mtp_features = mtp_module(
+                    h_t.float(),
+                    emb_next.float(),
+                    attention_mask=mtp_attention_mask,
+                )
+                loss, grad_features, correct_tokens, total_tokens = exact_chunked_kd(
+                    student_features=mtp_features,
+                    teacher_features=teacher_features,
+                    lm_head_weight=lm_head.weight,
+                    valid_mask=valid_mask,
+                    vocab_chunk_size=config.kd_vocab_chunk_size,
+                )
+
+                locally_finite = bool(
+                    torch.isfinite(loss).item() and torch.isfinite(grad_features).all().item()
+                )
+                if not all_ranks_true(locally_finite, device):
+                    if is_main_process:
+                        print(f"Skipping non-finite batch at epoch {epoch + 1}, step {step}")
+                    # Complete DDP's reducer lifecycle on every rank, then
+                    # discard this entire accumulation group.
+                    mtp_features.backward(torch.zeros_like(mtp_features))
+                    optimizer.zero_grad(set_to_none=True)
+                    accumulated_batches = 0
+                    continue
+
+                mtp_features.backward(grad_features)
+                accumulated_batches += 1
+                last_loss = float(loss.item())
+
+                if is_main_process and step % 50 == 0:
+                    accuracy = correct_tokens / max(total_tokens, 1)
+                    pbar.write(
+                        f"step={step} loss={last_loss:.4f} "
+                        f"teacher_match={accuracy:.2%}"
+                    )
+
+                if accumulated_batches == config.gradient_accumulation_steps:
+                    optimizer_step(
+                        mtp_module,
+                        optimizer,
+                        scheduler,
+                        accumulated_batches,
+                    )
+                    accumulated_batches = 0
+                    global_step += 1
+                    if is_main_process:
+                        pbar.set_postfix(
+                            loss=round(last_loss, 4),
+                            lr=scheduler.get_last_lr()[0],
+                        )
+
+                del (
+                    base_outputs,
+                    final_hidden,
+                    h_t,
+                    teacher_features,
+                    emb_next,
+                    mtp_features,
+                    grad_features,
+                )
+
+            # Flush a partial accumulation group instead of dropping it or
+            # carrying it into the next epoch.
+            if accumulated_batches:
+                optimizer_step(
+                    mtp_module,
+                    optimizer,
+                    scheduler,
+                    accumulated_batches,
+                )
+                global_step += 1
+
+            if is_main_process:
+                save_trainer_state(
+                    trainer_state_path,
+                    raw_mtp,
+                    optimizer,
+                    scheduler,
+                    next_epoch=epoch + 1,
+                    global_step=global_step,
+                )
+            if dist.is_initialized():
+                dist.barrier()
+
+        if is_main_process:
+            print("=== Saving Trained MTP Model ===")
+            save_path = os.path.join(config.output_dir, config.checkpoint_name)
+            torch.save(raw_mtp.state_dict(), save_path)
+            print(f"Saved PyTorch weights to: {save_path}")
+
+            gguf_dict = raw_mtp.export_llama_cpp_state_dict()
+            gguf_save_path = os.path.join(config.output_dir, "nanbeige_mtp_gguf_tensors.pt")
+            torch.save(gguf_dict, gguf_save_path)
+            print(f"Saved llama.cpp formatted tensors to: {gguf_save_path}")
+
+            if config.save_safetensors:
+                st_path = os.path.join(config.output_dir, "nanbeige_mtp_head.safetensors")
+                save_file(gguf_dict, st_path)
+                print(f"Saved Safetensors to: {st_path}")
+
+            print("=== Training Successfully Completed ===")
+    finally:
+        cleanup_distributed()
 
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser(description="Train MTP Head for Nanbeige")
-    parser.add_argument("--resume", action="store_true", help="Resume training from the latest checkpoint if it exists")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume model, optimizer, scheduler, epoch, and step from trainer_state.pt",
+    )
     args = parser.parse_args()
-    
     train(resume=args.resume)
