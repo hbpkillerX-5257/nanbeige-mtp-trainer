@@ -70,6 +70,14 @@ The training script automatically saves the model in three formats under `./mtp_
 The trainer also writes **`trainer_state.pt`** after each completed epoch for
 reliable `--resume` operation.
 
+Evaluate teacher-forced two-token agreement with the same model and tokenizer
+settings used during training:
+
+```bash
+python3 nanbeige_mtp_trainer/eval.py \
+    --weights ./mtp_output/nanbeige_mtp_head.pt
+```
+
 ---
 
 ## 🛠️ Exporting to GGUF for llama.cpp (`draft-mtp`)

@@ -1,138 +1,247 @@
-import sys
-import types
-
-# 1. UNINSTALL BROKEN FLASH_ATTN FROM PYTHON MEMORY
-for mod_name in list(sys.modules.keys()):
-    if mod_name.startswith("flash_attn"):
-        del sys.modules[mod_name]
-sys.modules["flash_attn"] = None
-
-# 2. DISABLE TRANSFORMERS CHECKS
-import transformers.utils.import_utils
-transformers.utils.import_utils.is_flash_attn_2_available = lambda: False
-import transformers.dynamic_module_utils
-transformers.dynamic_module_utils.check_imports = lambda filename: []
+import argparse
+from typing import Tuple
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
-from transformers.cache_utils import DynamicCache
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-# Patch DynamicCache for newer transformers compatibility
-if not hasattr(DynamicCache, "get_max_length"):
-    DynamicCache.get_max_length = lambda self: getattr(self, "get_seq_length", lambda: None)()
-
-from mtp_model import MTPModule
 from config import TrainingConfig
-from tqdm import tqdm
+from mtp_model import MTPModule
+from train import normalize_nanbeige_rope_scaling, resolve_model_dtype
 
-def evaluate_acceptance_rate(
-    base_model_name="Nanbeige/Nanbeige4.2-3B",
-    mtp_weights_path="mtp_output/nanbeige_mtp_head.pt",
-    text_sample="The history of artificial intelligence began in antiquity, with myths, stories and rumors of artificial beings endowed with intelligence or consciousness by master craftsmen. As the field evolved, researchers developed mathematical models of human reasoning.",
-    device="cuda:0"
-):
-    print("=== Loading Tokenizer and Base Model ===")
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
-    
-    # Patch rope scaling for transformers compatibility if needed
-    model_config = AutoConfig.from_pretrained(base_model_name, trust_remote_code=True)
-    if hasattr(model_config, "rope_scaling") and model_config.rope_scaling:
-        if isinstance(model_config.rope_scaling, dict):
-            model_config.rope_scaling["type"] = "linear"
-            model_config.rope_scaling["factor"] = 1.0
-                
-    base_model = AutoModelForCausalLM.from_pretrained(
-        base_model_name, 
-        config=model_config,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16, 
-        trust_remote_code=True,
-        device_map={"": device}
+
+@torch.no_grad()
+def chunked_top1(
+    features: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    vocab_chunk_size: int,
+) -> torch.Tensor:
+    """Return exact LM-head top-1 IDs without allocating full-vocabulary logits."""
+    if vocab_chunk_size <= 0:
+        raise ValueError("kd_vocab_chunk_size must be positive")
+
+    original_shape = features.shape[:-1]
+    flat_features = features.reshape(-1, features.size(-1)).to(lm_head_weight.dtype)
+    best_values = torch.full(
+        (flat_features.size(0),),
+        -torch.inf,
+        device=features.device,
+        dtype=torch.float32,
     )
-    base_model.eval()
+    best_ids = torch.zeros(
+        flat_features.size(0),
+        device=features.device,
+        dtype=torch.long,
+    )
+
+    for start in range(0, lm_head_weight.size(0), vocab_chunk_size):
+        end = min(start + vocab_chunk_size, lm_head_weight.size(0))
+        logits = F.linear(flat_features, lm_head_weight[start:end]).float()
+        chunk_values, chunk_ids = logits.max(dim=-1)
+        replace = chunk_values > best_values
+        best_values = torch.maximum(best_values, chunk_values)
+        best_ids[replace] = chunk_ids[replace] + start
+
+    return best_ids.reshape(original_shape)
+
+
+def build_evaluation_text(tokenizer, assistant_text: str) -> str:
+    """Use the same user/assistant conversation shape as Alpaca training rows."""
+    messages = [
+        {
+            "role": "user",
+            "content": "Write a short overview of the history of artificial intelligence.",
+        },
+        {"role": "assistant", "content": assistant_text},
+    ]
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    except Exception:
+        return (
+            f"User: {messages[0]['content']}\n\n"
+            f"Assistant: {messages[1]['content']}"
+        )
+
+
+def load_base_model(
+    model_name: str,
+    device: torch.device,
+    training_config: TrainingConfig,
+) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
+    """Load tokenizer and teacher with the same compatibility settings as training."""
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        use_fast=False,
+    )
+    if tokenizer.pad_token is None:
+        if tokenizer.unk_token is not None:
+            tokenizer.pad_token = tokenizer.unk_token
+        elif tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        else:
+            raise ValueError("Tokenizer has no existing token that can be used for padding")
+    tokenizer.padding_side = "right"
+
+    model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    normalize_nanbeige_rope_scaling(model_config)
+    model_config._attn_implementation = "eager"
+    dtype = resolve_model_dtype(training_config, device)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        config=model_config,
+        torch_dtype=dtype,
+        trust_remote_code=True,
+        attn_implementation="eager",
+        device_map={"": device},
+    )
+    model.eval()
+    return tokenizer, model
+
+
+@torch.no_grad()
+def evaluate_acceptance_rate(
+    base_model_name: str = "Nanbeige/Nanbeige4.2-3B",
+    mtp_weights_path: str = "mtp_output/nanbeige_mtp_head.pt",
+    text_sample: str = (
+        "The history of artificial intelligence began in antiquity, with myths "
+        "and stories of artificial beings endowed with intelligence. The modern "
+        "field emerged from advances in logic, computation, neuroscience, and "
+        "the formal study of human reasoning."
+    ),
+    device_name: str = "cuda:0",
+) -> None:
+    training_config = TrainingConfig()
+    device = torch.device(device_name if torch.cuda.is_available() else "cpu")
+
+    print("=== Loading Tokenizer and Base Model ===")
+    tokenizer, base_model = load_base_model(
+        base_model_name,
+        device,
+        training_config,
+    )
 
     print(f"=== Loading MTP Head from {mtp_weights_path} ===")
-    config = TrainingConfig()
-    # Initialize MTP module
     mtp_module = MTPModule(
         hidden_size=base_model.config.hidden_size,
-        base_layer=base_model.model.layers[-1]
+        base_layer=base_model.model.layers[-1],
     ).to(device=device, dtype=torch.float32)
-    
-    # Load PyTorch weights
     state_dict = torch.load(mtp_weights_path, map_location=device, weights_only=True)
     mtp_module.load_state_dict(state_dict)
     mtp_module.eval()
 
-    print("=== Running Evaluation ===")
-    messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": text_sample}
-    ]
-    formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(formatted_text, return_tensors="pt").to(device)
+    formatted_text = build_evaluation_text(tokenizer, text_sample)
+    inputs = tokenizer(
+        formatted_text,
+        return_tensors="pt",
+        add_special_tokens=False,
+    ).to(device)
     input_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
-    
-    with torch.no_grad():
-        # Get base model outputs
-        outputs = base_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            use_cache=False
+    if input_ids.size(1) < 4:
+        raise ValueError("Evaluation sample must contain at least four tokens")
+
+    print("=== Running Evaluation ===")
+    base_outputs = base_model.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=False,
+        use_cache=False,
+        return_dict=True,
+    )
+    final_hidden = base_outputs.last_hidden_state
+
+    # This exactly matches training:
+    # h_t + embedding(y_{t+1}) -> MTP prediction for the teacher at t+2.
+    h_t = final_hidden[:, :-2, :]
+    teacher_features = final_hidden[:, 1:-1, :]
+    emb_next = base_model.get_input_embeddings()(input_ids[:, 1:-1])
+    mtp_attention_mask = attention_mask[:, :-2]
+    valid_mask = attention_mask[:, 2:].bool()
+
+    mtp_features = mtp_module(
+        h_t.float(),
+        emb_next.float(),
+        attention_mask=mtp_attention_mask,
+    )
+    lm_head_weight = base_model.get_output_embeddings().weight
+    teacher_preds = chunked_top1(
+        teacher_features,
+        lm_head_weight,
+        training_config.kd_vocab_chunk_size,
+    )
+    mtp_preds = chunked_top1(
+        mtp_features,
+        lm_head_weight,
+        training_config.kd_vocab_chunk_size,
+    )
+
+    valid_teacher = teacher_preds[valid_mask]
+    valid_mtp = mtp_preds[valid_mask]
+    valid_targets = input_ids[:, 2:][valid_mask]
+    correct = int((valid_mtp == valid_teacher).sum().item())
+    total = int(valid_teacher.numel())
+    acceptance_rate = 100.0 * correct / max(total, 1)
+    teacher_target_rate = 100.0 * int(
+        (valid_teacher == valid_targets).sum().item()
+    ) / max(total, 1)
+    unique_teacher = int(valid_teacher.unique().numel())
+    unique_mtp = int(valid_mtp.unique().numel())
+
+    print("\n" + "=" * 58)
+    print(f"Total tokens evaluated:              {total}")
+    print(f"MTP tokens matching teacher:         {correct}")
+    print(f"Teacher/MTP top-1 agreement:         {acceptance_rate:.2f}%")
+    print(f"Teacher top-1 vs actual next token:  {teacher_target_rate:.2f}%")
+    print(f"Unique teacher top-1 predictions:    {unique_teacher}")
+    print(f"Unique MTP top-1 predictions:        {unique_mtp}")
+    print("=" * 58)
+
+    if unique_teacher <= 2 and total >= 20:
+        print(
+            "\nWARNING: The base teacher has collapsed to almost constant "
+            "predictions. Do not use the MTP agreement score until the base "
+            "model precision/attention path is healthy."
         )
-        
-        # Base model predictions for next token
-        # logits shape: [1, seq_len, vocab_size]
-        base_logits = outputs.logits
-        base_preds = torch.argmax(base_logits, dim=-1) # [1, seq_len]
-        
-        # Hidden states h_t (for step t): [1, seq_len-2, D] 
-        h_t = outputs.hidden_states[-1][:, :-2, :]
-        
-        # Token embeddings e(y_{t+1}): [1, seq_len-2, D]
-        embed_layer = base_model.get_input_embeddings()
-        
-        # In speculative decoding, we use the base model's prediction as the proposed y_{t+1}
-        # But for exact accuracy, we use the ground truth token at t+1 just like training.
-        # This isolates MTP's accuracy without compounding base model errors.
-        emb_next = embed_layer(input_ids[:, 1:-1])
-        
-        # Forward pass through MTP module
-        mtp_features = mtp_module(h_t.to(torch.float32), emb_next.to(torch.float32))
-        
-        # Compute MTP logits
-        lm_head = base_model.get_output_embeddings()
-        mtp_logits = F.linear(mtp_features.to(lm_head.weight.dtype), lm_head.weight)
-        mtp_preds = torch.argmax(mtp_logits, dim=-1) # [1, seq_len-2]
-        
-        # Alignment:
-        # Base model prediction for step t+2 is base_preds[:, 1:-1] (since base_preds[i] predicts t+i+1)
-        # MTP prediction for step t+2 is mtp_preds
-        target_base_preds = base_preds[:, 1:-1]
-        
-        correct = (mtp_preds == target_base_preds).sum().item()
-        total = target_base_preds.numel()
-        
-        acceptance_rate = (correct / total) * 100
-        
-        print("\n" + "="*50)
-        print(f"Total tokens evaluated: {total}")
-        print(f"Tokens matching base model (Accepted): {correct}")
-        print(f"Top-1 Acceptance Rate: {acceptance_rate:.2f}%")
-        print("="*50)
-        
-        # Print a small sample
-        print("\nSample Predictions:")
-        for i in range(min(10, total)):
-            context = tokenizer.decode(input_ids[0, :i+2])
-            base_tok = tokenizer.decode([target_base_preds[0, i].item()])
-            mtp_tok = tokenizer.decode([mtp_preds[0, i].item()])
-            match = "✅" if base_tok == mtp_tok else "❌"
-            print(f"Context: {repr(context)}")
-            print(f"  Base Model Predicts: {repr(base_tok)}")
-            print(f"  MTP Head Predicts  : {repr(mtp_tok)} {match}\n")
+
+    print("\nSample Predictions:")
+    valid_positions = valid_mask[0].nonzero(as_tuple=False).flatten()
+    for position in valid_positions[:10].tolist():
+        context_end = position + 2
+        teacher_id = int(teacher_preds[0, position].item())
+        mtp_id = int(mtp_preds[0, position].item())
+        context = tokenizer.decode(input_ids[0, :context_end])
+        teacher_token = tokenizer.decode([teacher_id])
+        mtp_token = tokenizer.decode([mtp_id])
+        match = "✅" if teacher_id == mtp_id else "❌"
+        print(f"Context: {context!r}")
+        print(f"  Base Model Predicts: {teacher_token!r}")
+        print(f"  MTP Head Predicts  : {mtp_token!r} {match}\n")
+
 
 if __name__ == "__main__":
-    evaluate_acceptance_rate()
+    parser = argparse.ArgumentParser(
+        description="Evaluate teacher-forced two-token MTP agreement"
+    )
+    parser.add_argument(
+        "--model",
+        default="Nanbeige/Nanbeige4.2-3B",
+        help="Base Hugging Face model name or path",
+    )
+    parser.add_argument(
+        "--weights",
+        default="mtp_output/nanbeige_mtp_head.pt",
+        help="Path to the trained MTP PyTorch state dict",
+    )
+    parser.add_argument("--device", default="cuda:0")
+    args = parser.parse_args()
+    evaluate_acceptance_rate(
+        base_model_name=args.model,
+        mtp_weights_path=args.weights,
+        device_name=args.device,
+    )
