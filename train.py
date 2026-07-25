@@ -13,9 +13,27 @@ sys.path.insert(0, str(Path(__file__).parent))
 # installation cannot be selected accidentally.
 import transformers.utils
 import transformers.utils.import_utils
+import transformers.dynamic_module_utils
 
 transformers.utils.import_utils.is_flash_attn_2_available = lambda: False
 transformers.utils.is_flash_attn_2_available = lambda: False
+
+# Transformers 4.42's remote-code dependency scanner does not understand the
+# model's `if is_flash_attn_2_available():` guard and incorrectly treats
+# flash_attn as mandatory. Filter only that optional import; keep every other
+# dependency and relative-import check intact.
+_transformers_get_imports = transformers.dynamic_module_utils.get_imports
+
+
+def _get_imports_without_optional_flash_attn(filename):
+    return [
+        package
+        for package in _transformers_get_imports(filename)
+        if package != "flash_attn"
+    ]
+
+
+transformers.dynamic_module_utils.get_imports = _get_imports_without_optional_flash_attn
 
 import torch
 import torch.distributed as dist
