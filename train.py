@@ -196,7 +196,9 @@ def validate_teacher_health(
     ).to(device)
     outputs = base_model.model(
         input_ids=inputs["input_ids"],
-        attention_mask=inputs["attention_mask"],
+        # The official Nanbeige quickstart supplies only input_ids for an
+        # unpadded sequence.
+        attention_mask=None,
         output_hidden_states=False,
         use_cache=False,
         return_dict=True,
@@ -215,14 +217,16 @@ def validate_teacher_health(
     matches = int((predictions == targets).sum().item())
     accuracy = matches / max(total, 1)
     unique_predictions = int(predictions.unique().numel())
+    minimum_unique = max(8, total // 8)
 
-    if matches == 0 or unique_predictions < 4:
+    if unique_predictions < minimum_unique:
         raise RuntimeError(
             "Base teacher health check failed: "
             f"next-token accuracy={accuracy:.2%}, "
             f"unique_predictions={unique_predictions}/{total}. "
             "The teacher has collapsed, so MTP training would be invalid. "
-            "Nanbeige4.2 requires BF16 (or FP32); do not train it in FP16."
+            "Check BF16 support and use the Transformers/model-code versions "
+            "recommended by Nanbeige."
         )
     return accuracy, unique_predictions, total
 
@@ -417,21 +421,22 @@ def train(resume: bool = False) -> None:
 
         model_config = AutoConfig.from_pretrained(config.base_model_name, trust_remote_code=True)
         normalize_nanbeige_rope_scaling(model_config)
-        # Use the eager implementation because the MTP block supplies an explicit
-        # four-dimensional additive mask and FlashAttention is intentionally off.
-        model_config._attn_implementation = "eager"
-
         base_model = AutoModelForCausalLM.from_pretrained(
             config.base_model_name,
             config=model_config,
             torch_dtype=dtype,
             trust_remote_code=True,
-            attn_implementation="eager",
             device_map={"": device},
         )
         for parameter in base_model.parameters():
             parameter.requires_grad = False
         base_model.eval()
+        if is_main_process:
+            print(
+                f"Transformers {transformers.__version__}; "
+                "attention implementation: "
+                f"{getattr(base_model.config, '_attn_implementation', 'unknown')}"
+            )
 
         teacher_accuracy, teacher_unique, teacher_tokens = validate_teacher_health(
             base_model,
@@ -536,7 +541,12 @@ def train(resume: bool = False) -> None:
                 with torch.no_grad():
                     base_outputs = base_model.model(
                         input_ids=input_ids,
-                        attention_mask=attention_mask,
+                        # Follow Nanbeige's official unmasked path when this
+                        # batch has no padding. A mask is needed only for
+                        # genuinely padded batches.
+                        attention_mask=(
+                            None if bool(attention_mask.all().item()) else attention_mask
+                        ),
                         output_hidden_states=False,
                         use_cache=False,
                         return_dict=True,

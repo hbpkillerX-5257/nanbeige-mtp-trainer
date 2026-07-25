@@ -36,7 +36,6 @@ def load_base_model(
 
     model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     normalize_nanbeige_rope_scaling(model_config)
-    model_config._attn_implementation = "eager"
     dtype = resolve_model_dtype(training_config, device)
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -44,7 +43,6 @@ def load_base_model(
         config=model_config,
         torch_dtype=dtype,
         trust_remote_code=True,
-        attn_implementation="eager",
         device_map={"": device},
     )
     model.eval()
@@ -104,7 +102,7 @@ def evaluate_acceptance_rate(
     print("=== Running Evaluation ===")
     base_outputs = base_model.model(
         input_ids=input_ids,
-        attention_mask=attention_mask,
+        attention_mask=None if bool(attention_mask.all().item()) else attention_mask,
         output_hidden_states=False,
         use_cache=False,
         return_dict=True,
